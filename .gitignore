@@ -1,0 +1,71 @@
+# Environment variables (contains API tokens)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.manifest
+*.spec
+*.pyc
+.mypy_cache/
+.pytest_cache/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model cache (large files - don't commit to git)
+*.pt
+*.bin
+*.safetensors
+*.gguf
+models/
+
+# HuggingFace cache
+.cache/
+huggingface/
+
+# Data files (keep structure, ignore large files)
+data/input/*.jpg
+data/input/*.jpeg
+data/input/*.png
+data/input/*.bmp
+data/input/*.tiff
+data/output/*.txt
+data/output/*.md
+
+# Keep the directory structure
+!data/input/.gitkeep
+!data/output/.gitkeep
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Logs
+*.log
+logs/
