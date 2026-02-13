@@ -1,7 +1,0 @@
-Pillow
-requests
-torch
-transformers
-# Optional — for advanced image preprocessing (high_contrast, binarize, deskew)
-# opencv-python
-# numpy

@@ -1,0 +1,35 @@
+[project]
+name = "handwritten-ocr"
+version = "0.1.0"
+description = "Local-first OCR pipeline for converting handwritten notes to text using vision-language models."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "transformers>=4.40.0",
+    "pillow",
+    "sentencepiece",
+    "accelerate",
+    "tiktoken",
+    "verovio",
+    "compressed-tensors",
+    "python-dotenv",
+    "requests",
+    "opencv-python",
+    "numpy",
+]
+
+[project.optional-dependencies]
+notebooks = ["jupyter", "ipykernel", "matplotlib"]
+
+[project.scripts]
+ocr = "ocr_agent.transcribe:main"
+
+[tool.poetry]
+packages = [{ include = "ocr_agent" }]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
