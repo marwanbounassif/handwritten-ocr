@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Local-first OCR pipeline converting handwritten note images to text using HuggingFace vision-language models. Runs on Apple Silicon (MPS), NVIDIA (CUDA), or CPU — no cloud APIs for inference. The project uses a Conda environment (`handwritten-ocr`) managed via `environment.yml`.
+Local-first OCR pipeline converting handwritten note images to text using HuggingFace vision-language models. Runs on Apple Silicon (MPS), NVIDIA (CUDA), or CPU — no cloud APIs for inference. The project is packaged with Poetry (`pyproject.toml`).
 
 ## Architecture
 
@@ -18,13 +18,14 @@ Local-first OCR pipeline converting handwritten note images to text using Huggin
 ## Environment & Setup
 
 ```bash
-conda env create -f environment.yml
-conda activate handwritten-ocr
+poetry install                        # core dependencies
+poetry install --extras notebooks     # include Jupyter/matplotlib
 ```
 
-- Python 3.10, PyTorch with MPS/CUDA support
+- Python 3.10+, PyTorch with MPS/CUDA support
 - HuggingFace token required in `.env` (see `.env.example`) — needed for gated model downloads
 - Token loaded via `python-dotenv`; the notebook loads from `Path.cwd().parent / ".env"`
+- CLI entry point: `ocr` (or `python -m ocr_agent`)
 
 ## Device Selection Pattern
 
