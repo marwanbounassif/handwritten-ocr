@@ -17,17 +17,16 @@ from pathlib import Path
 def eval_single(
     transcription_path: Path,
     ground_truth_path: Path | None = None,
+    text_eval_only: bool = False,
 ) -> dict:
     """Evaluate a single transcription file."""
-    from ocr_agent.tools import evaluate, tier1_metrics
+    from ocr_agent.tools import evaluate, parse_ground_truth, tier1_metrics
 
     transcription = transcription_path.read_text(encoding="utf-8")
 
-    ground_truth = None
-    if ground_truth_path and ground_truth_path.exists():
-        ground_truth = ground_truth_path.read_text(encoding="utf-8")
+    ground_truth = parse_ground_truth(ground_truth_path) if ground_truth_path else None
 
-    result = evaluate(transcription, ground_truth=ground_truth)
+    result = evaluate(transcription, ground_truth=ground_truth, text_eval_only=text_eval_only)
     result["file"] = str(transcription_path)
     return result
 
@@ -92,6 +91,11 @@ def main():
         default=None,
         help="Path to save evaluation JSON (default: print to stdout)",
     )
+    parser.add_argument(
+        "--text-eval-only",
+        action="store_true",
+        help="Evaluate text only, without calling LLM critic",
+    )
 
     args = parser.parse_args()
     input_path: Path = args.input.resolve()
@@ -102,7 +106,7 @@ def main():
 
     # Single file mode
     if input_path.is_file():
-        result = eval_single(input_path, args.ground_truth)
+        result = eval_single(input_path, args.ground_truth, args.text_eval_only)
         print_eval(result, input_path.name)
 
         if args.output:
@@ -134,8 +138,9 @@ def main():
                 if candidate.exists():
                     gt_path = candidate
                     break
-
-        result = eval_single(txt_path, gt_path)
+        
+        print(args)
+        result = eval_single(txt_path, gt_path, args.text_eval_only)
         print_eval(result, txt_path.name)
         all_results.append(result)
 

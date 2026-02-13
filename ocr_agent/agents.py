@@ -85,7 +85,9 @@ def run_critic(transcription: str, previous_critique: dict | None = None) -> dic
         previous_critique_section=previous_section,
     )
 
+    print("  [critic] Analyzing transcription...")
     result = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg)
+    print(f"  [critic] Verdict: {result.get('verdict', '?')} (confidence {result.get('overall_confidence', '?')})")
 
     # Ensure required fields exist with safe defaults
     result.setdefault("overall_confidence", 0)
@@ -166,7 +168,9 @@ def run_editor(transcription: str, critique: dict) -> dict:
         issues_text="\n".join(issues_lines),
     )
 
+    print("  [editor] Fixing flagged issues...")
     result = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg)
+    print(f"  [editor] Applied {len(result.get('changes', []))} fixes, {len(result.get('unresolved', []))} unresolved")
 
     # Ensure required fields
     result.setdefault("corrected_text", transcription)
@@ -235,7 +239,9 @@ def run_arbitrator(versions: list[dict]) -> dict:
         versions_text="\n\n".join(versions_text_parts)
     )
 
+    print(f"  [arbitrator] Comparing {len(versions)} versions...")
     result = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg)
+    print(f"  [arbitrator] Merged (confidence {result.get('confidence', '?')})")
 
     # Ensure required fields
     result.setdefault("final_text", versions[0]["text"] if versions else "")

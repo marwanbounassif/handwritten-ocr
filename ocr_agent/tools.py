@@ -22,6 +22,29 @@ from PIL import Image
 
 from ocr_agent import config
 
+# ── Ground Truth Parsing ──────────────────────────────────────────
+
+
+def parse_ground_truth(file_path: str | Path) -> str | None:
+    """
+    Read a ground-truth markdown file and extract only the text under
+    the ``## Ground Truth`` header.  Returns None if the file doesn't
+    exist or has no such section.
+    """
+    p = Path(file_path)
+    if not p.exists():
+        return None
+    raw = p.read_text(encoding="utf-8")
+    # Find the "## Ground Truth" header and take everything after it
+    marker = "## Ground Truth"
+    idx = raw.find(marker)
+    if idx == -1:
+        # No header found — assume the whole file is plain-text ground truth
+        return raw.strip() or None
+    text = raw[idx + len(marker) :].strip()
+    return text or None
+
+
 # ── Text Normalization ────────────────────────────────────────────
 
 
@@ -121,31 +144,113 @@ def tier1_metrics(ground_truth: str, ocr_output: str, lower: bool = False) -> di
 import requests
 
 
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks from the response, returning only the final answer."""
+    return re.sub(r"<think>[\s\S]*?</think>\s*", "", text).strip()
+
+
 def call_llm(
     system_prompt: str,
     user_message: str,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    stream: bool | None = None,
+    stop: list[str] | None = None,
 ) -> str:
-    """Call an OpenAI-compatible chat endpoint. Returns the assistant message text."""
+    """
+    Call an OpenAI-compatible chat endpoint. Returns the assistant message text.
+    Supports streaming and Qwen3 thinking mode (<think> tags are stripped from output).
+    """
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_message})
 
+    should_stream = stream if stream is not None else config.LLM_STREAM
+    stop_seqs = stop if stop is not None else config.LLM_STOP_SEQUENCES
+
+    body: dict = {
+        "model": config.OPENAI_MODEL,
+        "messages": messages,
+        "temperature": temperature if temperature is not None else config.LLM_TEMPERATURE,
+        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
+        "stream": should_stream,
+    }
+    if stop_seqs:
+        body["stop"] = stop_seqs
+
+    print(f"  [llm] Calling {config.OPENAI_MODEL}...", flush=True)
+
+    if should_stream:
+        text = _call_llm_stream(body)
+    else:
+        resp = requests.post(
+            f"{config.OPENAI_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+            json=body,
+            timeout=config.LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+
+    # Strip thinking blocks if present
+    if config.LLM_ENABLE_THINKING:
+        text = _strip_think_tags(text)
+
+    print(f"  [llm] Done ({len(text)} chars)")
+    return text
+
+
+def _call_llm_stream(body: dict) -> str:
+    """Stream an LLM response, printing tokens live. Returns the full assembled text."""
+    import sys
+
     resp = requests.post(
         f"{config.OPENAI_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-        json={
-            "model": config.OPENAI_MODEL,
-            "messages": messages,
-            "temperature": temperature if temperature is not None else config.LLM_TEMPERATURE,
-            "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-        },
+        json=body,
         timeout=config.LLM_TIMEOUT,
+        stream=True,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+
+    chunks: list[str] = []
+    in_think = False
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload.strip() == "[DONE]":
+            break
+        try:
+            delta = json.loads(payload)["choices"][0]["delta"]
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+        token = delta.get("content", "")
+        if not token:
+            continue
+
+        chunks.append(token)
+
+        # Live-print non-thinking tokens so the user sees progress
+        if config.LLM_ENABLE_THINKING:
+            partial = "".join(chunks)
+            if not in_think and "<think>" in partial:
+                in_think = True
+            if in_think and "</think>" in partial:
+                in_think = False
+                continue
+            if not in_think and not partial.rstrip().endswith("<think>"):
+                sys.stdout.write(token)
+                sys.stdout.flush()
+        else:
+            sys.stdout.write(token)
+            sys.stdout.flush()
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return "".join(chunks)
 
 
 def parse_json_response(raw: str) -> dict | None:
@@ -243,8 +348,11 @@ Respond with ONLY the corrected text. No preamble, no explanations, no labels, n
 
 def tier23_llm_eval(ocr_output: str) -> str:
     """Single LLM call: correct OCR output. Returns corrected text string."""
+    print("  [eval] Running LLM correction...")
     prompt = LLM_EVAL_PROMPT.format(ocr_text=ocr_output)
-    return call_llm("", prompt)
+    result = call_llm("", prompt)
+    print(f"  [eval] LLM correction done ({len(result)} chars)")
+    return result
 
 
 # ── Full Evaluation Pipeline ─────────────────────────────────────
@@ -254,25 +362,31 @@ def evaluate(
     transcription: str,
     ground_truth: str | None = None,
     lower: bool = False,
+    text_eval_only: bool = False,
 ) -> dict:
     """
     Full evaluation: CER/WER if ground_truth provided, plus LLM scoring/correction.
     Returns structured dict with all metrics and corrected text.
     """
     result = {}
+    print("  [eval] Starting evaluation...")
 
     # Tier 1: hard metrics against ground truth
     if ground_truth is not None:
+        print("  [eval] Computing CER/WER against ground truth...")
         result["tier1_raw_vs_gt"] = tier1_metrics(ground_truth, transcription, lower)
 
-    # Tier 2+3: LLM correction
-    corrected = tier23_llm_eval(transcription)
-    result["corrected_text"] = corrected
+    if not text_eval_only:
+        # Tier 2+3: LLM correction
+        corrected = tier23_llm_eval(transcription)
+        result["corrected_text"] = corrected
 
-    # Tier 1 on corrected text vs ground truth (did correction help?)
-    if ground_truth is not None:
-        result["tier1_corrected_vs_gt"] = tier1_metrics(ground_truth, corrected, lower)
+        # Tier 1 on corrected text vs ground truth (did correction help?)
+        if ground_truth is not None:
+            print("  [eval] Computing CER/WER on corrected text...")
+            result["tier1_corrected_vs_gt"] = tier1_metrics(ground_truth, corrected, lower)
 
+    print("  [eval] Evaluation complete")
     return result
 
 
@@ -450,96 +564,183 @@ def _align_to_backbone(backbone: list[str], words: list[str]) -> list[str | None
 
 
 # ── Image Preprocessing ──────────────────────────────────────────
+#
+# Each transform is a standalone function: PIL Image → PIL Image.
+# preprocess_image() accepts a single strategy string OR a list of
+# strings to chain multiple transforms sequentially (e.g. ["deskew", "high_contrast", "sharpen"]).
 
 
-def preprocess_image(image_path: str, strategy: str) -> str:
+def _apply_high_contrast(img: Image.Image) -> Image.Image:
+    """CLAHE contrast enhancement. Falls back to PIL if OpenCV unavailable."""
+    try:
+        import cv2
+        import numpy as np
+
+        img_array = np.array(img)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        return Image.fromarray(clahe.apply(gray))
+    except ImportError:
+        from PIL import ImageEnhance
+
+        return ImageEnhance.Contrast(img).enhance(2.0)
+
+
+def _apply_binarize(img: Image.Image) -> Image.Image:
+    """Adaptive thresholding. Falls back to PIL point() if OpenCV unavailable."""
+    try:
+        import cv2
+        import numpy as np
+
+        img_array = np.array(img)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
+        return Image.fromarray(
+            cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10)
+        )
+    except ImportError:
+        return img.convert("L").point(lambda x: 255 if x > 128 else 0)
+
+
+def _apply_sharpen(img: Image.Image) -> Image.Image:
+    """Unsharp-mask style sharpening. Falls back to PIL if OpenCV unavailable."""
+    try:
+        import cv2
+        import numpy as np
+
+        img_array = np.array(img)
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        return Image.fromarray(cv2.filter2D(img_array, -1, kernel))
+    except ImportError:
+        from PIL import ImageFilter
+
+        return img.filter(ImageFilter.SHARPEN)
+
+
+def _apply_deskew(img: Image.Image) -> Image.Image:
+    """Detect skew angle via minAreaRect and rotate to correct. Needs OpenCV."""
+    try:
+        import cv2
+        import numpy as np
+
+        img_array = np.array(img)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
+        coords = np.column_stack(np.where(gray < 128))
+        if len(coords) <= 100:
+            return img
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        h, w = gray.shape
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(
+            img_array, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+        )
+        return Image.fromarray(rotated)
+    except ImportError:
+        return img
+
+
+def _apply_denoise(img: Image.Image) -> Image.Image:
+    """Non-local means denoising. Smooths scanner/camera noise while preserving edges."""
+    try:
+        import cv2
+        import numpy as np
+
+        img_array = np.array(img)
+        if len(img_array.shape) == 3:
+            denoised = cv2.fastNlMeansDenoisingColored(img_array, None, 10, 10, 7, 21)
+        else:
+            denoised = cv2.fastNlMeansDenoising(img_array, None, 10, 7, 21)
+        return Image.fromarray(denoised)
+    except ImportError:
+        return img
+
+
+def _apply_remove_lines(img: Image.Image) -> Image.Image:
+    """Remove horizontal ruled lines from notebook paper. Needs OpenCV."""
+    try:
+        import cv2
+        import numpy as np
+
+        img_array = np.array(img)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
+
+        # Detect horizontal lines with a wide kernel
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (gray.shape[1] // 4, 1))
+        lines_mask = cv2.morphologyEx(
+            cv2.adaptiveThreshold(
+                cv2.bitwise_not(gray), 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, -2
+            ),
+            cv2.MORPH_OPEN,
+            horizontal_kernel,
+            iterations=1,
+        )
+
+        # Dilate the line mask slightly so we cover the full line width
+        lines_mask = cv2.dilate(lines_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)))
+
+        # Inpaint the lines away
+        result = cv2.inpaint(img_array, lines_mask, 3, cv2.INPAINT_TELEA)
+        return Image.fromarray(result)
+    except ImportError:
+        return img
+
+
+# Registry of single-step transforms
+_TRANSFORMS = {
+    "high_contrast": _apply_high_contrast,
+    "binarize": _apply_binarize,
+    "sharpen": _apply_sharpen,
+    "deskew": _apply_deskew,
+    "denoise": _apply_denoise,
+    "remove_lines": _apply_remove_lines,
+}
+
+
+def preprocess_image(image_path: str, strategy: str | list[str]) -> str:
     """
     Apply image preprocessing and save to a temp file. Returns the new path.
-    Strategies: "original", "high_contrast", "binarize", "sharpen", "deskew"
-    Falls back to original if OpenCV is not installed.
+
+    strategy can be:
+      - A single string:  "high_contrast"
+      - A list of strings: ["deskew", "high_contrast", "sharpen"]  (applied left-to-right)
+      - "original" (no-op, returns the input path)
+
+    Available transforms: original, high_contrast, binarize, sharpen, deskew, denoise, remove_lines
     """
-    if strategy == "original":
+    # Normalise to a list
+    if isinstance(strategy, str):
+        steps = [strategy]
+    else:
+        steps = list(strategy)
+
+    # No-op shortcut
+    if steps == ["original"] or not steps:
         return image_path
 
+    label = "+".join(s for s in steps if s != "original")
+    print(f"  [preprocess] Applying {label}...")
     img = Image.open(image_path)
 
-    try:
-        import numpy as np
-    except ImportError:
-        print(f"  [preprocess] numpy not installed, using original image")
-        return image_path
+    for step in steps:
+        if step == "original":
+            continue
+        fn = _TRANSFORMS.get(step)
+        if fn is None:
+            print(f"  [preprocess] Unknown transform '{step}', skipping")
+            continue
+        img = fn(img)
 
-    img_array = np.array(img)
-
-    if strategy == "high_contrast":
-        try:
-            import cv2
-
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            result = Image.fromarray(enhanced)
-        except ImportError:
-            # PIL-only fallback
-            from PIL import ImageEnhance
-
-            result = ImageEnhance.Contrast(img).enhance(2.0)
-
-    elif strategy == "binarize":
-        try:
-            import cv2
-
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
-            result = Image.fromarray(
-                cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10)
-            )
-        except ImportError:
-            result = img.convert("L").point(lambda x: 255 if x > 128 else 0)
-
-    elif strategy == "sharpen":
-        try:
-            import cv2
-
-            kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-            sharpened = cv2.filter2D(img_array, -1, kernel)
-            result = Image.fromarray(sharpened)
-        except ImportError:
-            from PIL import ImageFilter
-
-            result = img.filter(ImageFilter.SHARPEN)
-
-    elif strategy == "deskew":
-        try:
-            import cv2
-
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
-            coords = np.column_stack(np.where(gray < 128))
-            if len(coords) > 100:
-                angle = cv2.minAreaRect(coords)[-1]
-                if angle < -45:
-                    angle = -(90 + angle)
-                else:
-                    angle = -angle
-                h, w = gray.shape
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                rotated = cv2.warpAffine(
-                    img_array, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-                )
-                result = Image.fromarray(rotated)
-            else:
-                result = img
-        except ImportError:
-            result = img
-    else:
-        print(f"  [preprocess] Unknown strategy '{strategy}', using original")
-        return image_path
-
-    # Save to temp file
+    # Build a label for the temp filename
+    label = "+".join(s for s in steps if s != "original")
     suffix = Path(image_path).suffix or ".png"
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, prefix=f"ocr_{strategy}_")
-    result.save(tmp.name)
-    return tmp.name
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, prefix=f"ocr_{label}_")
+    result_path = tmp.name
+    img.save(result_path)
+    return result_path
 
 
 # ── OCR (olmOCR-2) ───────────────────────────────────────────────
@@ -603,6 +804,7 @@ def run_ocr(image_path: str, params: dict | None = None) -> str:
     """
     import torch
 
+    print(f"  [ocr] Running OCR on {Path(image_path).name}...")
     params = params or {}
     model, processor = _load_ocr_model()
 
@@ -635,4 +837,5 @@ def run_ocr(image_path: str, params: dict | None = None) -> str:
     result = processor.decode(
         output[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=True
     )
+    print(f"  [ocr] Done ({len(result)} chars)")
     return result

@@ -55,8 +55,9 @@ def run_pipeline(
 
     # ── PHASE 1: INITIAL READS ────────────────────────────────────
     print("\n=== PHASE 1: Initial OCR Reads ===")
-    _do_ocr_pass(state, trace, "original", strategy_list)
-    _do_ocr_pass(state, trace, "high_contrast", strategy_list)
+    _do_ocr_pass(state, trace, strategy_list[0] if strategy_list else "original", strategy_list)
+    if len(strategy_list) > 1:
+        _do_ocr_pass(state, trace, strategy_list[1], strategy_list)
 
     # Check agreement between first two candidates
     if len(state.candidates) >= 2:
@@ -73,8 +74,8 @@ def run_pipeline(
             decision="tiebreaker" if agreement < config.AGREEMENT_THRESHOLD else "merge",
         )
 
-        if agreement < config.AGREEMENT_THRESHOLD:
-            _do_ocr_pass(state, trace, "binarize", strategy_list)
+        if agreement < config.AGREEMENT_THRESHOLD and len(strategy_list) > 2:
+            _do_ocr_pass(state, trace, strategy_list[2], strategy_list)
 
     # Merge initial candidates
     candidate_texts = [c["text"] for c in state.candidates]
@@ -145,7 +146,7 @@ def run_pipeline(
         state.current_score = confidence
 
         # Check acceptance
-        if verdict == "accept" and confidence >= threshold:
+        if verdict == "accept" or confidence >= threshold:
             state.status = "completed"
             trace.log(
                 iteration=state.iteration,
@@ -241,34 +242,42 @@ def run_pipeline(
     return state, trace
 
 
+def _strategy_label(strategy: str | list[str]) -> str:
+    """Human-readable label for a strategy (single string or pipeline list)."""
+    if isinstance(strategy, list):
+        return "+".join(strategy)
+    return strategy
+
+
 def _do_ocr_pass(
     state: TranscriptionState,
     trace: Trace,
-    strategy: str,
-    strategy_list: list[str],
+    strategy: str | list[str],
+    strategy_list: list,
 ):
-    """Run a single OCR pass with the given preprocessing strategy."""
-    if strategy in state._strategies_used:
+    """Run a single OCR pass with the given preprocessing strategy (or pipeline)."""
+    label = _strategy_label(strategy)
+    if label in state._strategies_used:
         return
-    state._strategies_used.append(strategy)
+    state._strategies_used.append(label)
 
-    # Preprocess
+    # Preprocess (handles both single strings and lists)
     processed_path = preprocess_image(state.image_path, strategy)
     trace.log(
         iteration=0,
         agent="reader",
         action="preprocess",
         input_summary=f"Image: {state.image_path}",
-        output_summary=f"Preprocessed with '{strategy}'",
-        metrics={"strategy": strategy},
+        output_summary=f"Preprocessed with '{label}'",
+        metrics={"strategy": label},
     )
 
     # OCR
     text = run_ocr(processed_path)
     candidate = {
         "text": text,
-        "source": f"ocr_{strategy}",
-        "ocr_params": {"strategy": strategy},
+        "source": f"ocr_{label}",
+        "ocr_params": {"strategy": label},
         "score": None,
     }
     state.candidates.append(candidate)
@@ -277,10 +286,10 @@ def _do_ocr_pass(
         iteration=0,
         agent="reader",
         action="ocr",
-        input_summary=f"Preprocessed image ({strategy})",
-        output_summary=f"OCR pass ({strategy}) → {len(text)} chars",
+        input_summary=f"Preprocessed image ({label})",
+        output_summary=f"OCR pass ({label}) → {len(text)} chars",
         full_output={"text_preview": text[:200]},
-        metrics={"chars": len(text), "strategy": strategy},
+        metrics={"chars": len(text), "strategy": label},
     )
 
 
@@ -297,7 +306,7 @@ def _handle_reocr(
     # Find next unused strategy
     next_strategy = None
     for s in strategy_list:
-        if s not in state._strategies_used:
+        if _strategy_label(s) not in state._strategies_used:
             next_strategy = s
             break
 
@@ -305,7 +314,7 @@ def _handle_reocr(
         return False
 
     # Need to reload OCR model for re-OCR
-    print(f"\n--- Re-OCR with strategy: {next_strategy} ---")
+    print(f"\n--- Re-OCR with strategy: {_strategy_label(next_strategy)} ---")
     _do_ocr_pass(state, trace, next_strategy, strategy_list)
 
     # Unload OCR model again

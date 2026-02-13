@@ -27,7 +27,7 @@ def transcribe_single(
 ) -> Path:
     """Transcribe a single image and save all outputs. Returns the transcription path."""
     from ocr_agent.orchestrator import run_pipeline
-    from ocr_agent.tools import evaluate
+    from ocr_agent.tools import evaluate, parse_ground_truth
 
     name = image_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,9 +58,7 @@ def transcribe_single(
     print(f"Saved: {trace_summary_path}")
 
     # Final evaluation (and GT comparison if provided)
-    ground_truth = None
-    if ground_truth_path and ground_truth_path.exists():
-        ground_truth = ground_truth_path.read_text(encoding="utf-8")
+    ground_truth = parse_ground_truth(ground_truth_path) if ground_truth_path else None
 
     eval_result = evaluate(state.current_best, ground_truth=ground_truth)
     eval_result["pipeline_status"] = state.status
