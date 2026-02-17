@@ -5259,4 +5259,4 @@ notebooks = ["ipykernel", "jupyter", "matplotlib"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10"
-content-hash = "030f728356dc539644d4b61a2ba793014f3324fc0c95b6b0a8f9e46be96d1e63"
+content-hash = "623d264d1c844b39f68f724d8d6fa0eca0613521fcf2a2106d7b587367716146"

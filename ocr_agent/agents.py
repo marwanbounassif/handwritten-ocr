@@ -3,7 +3,66 @@ LLM agent definitions for the agentic OCR pipeline.
 Each agent is an LLM call to Qwen3 via a specific system prompt with structured JSON output.
 """
 
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from ocr_agent.tools import call_llm_json
+
+
+# ── Pydantic schemas for agent outputs ───────────────────────────
+
+
+class CriticIssue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    description: str = ""
+    severity: Literal["critical", "minor", "cosmetic"] = "minor"
+    suggestion: str = ""
+
+
+class CriticSegment(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    text: str = ""
+    confidence: int = Field(default=50, ge=0, le=100)
+    issues: list[CriticIssue] = []
+
+
+class CriticResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    overall_confidence: int = Field(default=0, ge=0, le=100)
+    segments: list[CriticSegment] = []
+    verdict: Literal["accept", "needs_editing", "needs_reocr"] = "needs_editing"
+    reasoning: str = ""
+
+
+class EditorChange(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    original: str = ""
+    corrected: str = ""
+    reason: str = ""
+    confidence: int = Field(default=50, ge=0, le=100)
+
+
+class EditorResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    corrected_text: str
+    changes: list[EditorChange] = []
+    unresolved: list[str] = []
+
+
+class ArbitratorDecision(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    segment: str = ""
+    chosen_version: int = 1
+    reason: str = ""
+
+
+class ArbitratorResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    final_text: str
+    decisions: list[ArbitratorDecision] = []
+    confidence: int = Field(default=0, ge=0, le=100)
+    uncertain_segments: list[str] = []
 
 # ── Critic Agent ──────────────────────────────────────────────────
 
@@ -66,18 +125,18 @@ Guidelines for verdict:
 - "needs_reocr": text is so garbled that linguistic correction alone won't recover it"""
 
 
-def run_critic(transcription: str, previous_critique: dict | None = None) -> dict:
+def run_critic(transcription: str, previous_critique: "CriticResult | None" = None) -> CriticResult:
     """
     Run the Critic Agent on a transcription.
-    Returns structured dict with confidence, segments, verdict, reasoning.
+    Returns validated CriticResult with confidence, segments, verdict, reasoning.
     """
     previous_section = ""
     if previous_critique:
         previous_section = (
             "## Previous Critique (for context — the text was edited since)\n"
-            f"Previous confidence: {previous_critique.get('overall_confidence', 'N/A')}\n"
-            f"Previous verdict: {previous_critique.get('verdict', 'N/A')}\n"
-            f"Previous reasoning: {previous_critique.get('reasoning', 'N/A')}"
+            f"Previous confidence: {previous_critique.overall_confidence}\n"
+            f"Previous verdict: {previous_critique.verdict}\n"
+            f"Previous reasoning: {previous_critique.reasoning}"
         )
 
     user_msg = CRITIC_USER_TEMPLATE.format(
@@ -86,15 +145,19 @@ def run_critic(transcription: str, previous_critique: dict | None = None) -> dic
     )
 
     print("  [critic] Analyzing transcription...")
-    result = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg)
-    print(f"  [critic] Verdict: {result.get('verdict', '?')} (confidence {result.get('overall_confidence', '?')})")
+    raw = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg)
 
-    # Ensure required fields exist with safe defaults
-    result.setdefault("overall_confidence", 0)
-    result.setdefault("segments", [])
-    result.setdefault("verdict", "needs_editing")
-    result.setdefault("reasoning", "")
+    try:
+        result = CriticResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [critic] WARNING: output validation failed: {e}")
+        result = CriticResult(
+            overall_confidence=0,
+            verdict="needs_editing",
+            reasoning="LLM output failed schema validation",
+        )
 
+    print(f"  [critic] Verdict: {result.verdict} (confidence {result.overall_confidence})")
     return result
 
 
@@ -144,19 +207,19 @@ Respond with ONLY a JSON object in this exact structure:
 IMPORTANT: The corrected_text must be the COMPLETE transcription with fixes applied, not just the changed parts."""
 
 
-def run_editor(transcription: str, critique: dict) -> dict:
+def run_editor(transcription: str, critique: CriticResult) -> EditorResult:
     """
     Run the Editor Agent to fix issues identified by the Critic.
-    Returns structured dict with corrected_text, changes, unresolved.
+    Returns validated EditorResult with corrected_text, changes, unresolved.
     """
     # Format issues for the editor
     issues_lines = []
-    for seg in critique.get("segments", []):
-        for issue in seg.get("issues", []):
+    for seg in critique.segments:
+        for issue in seg.issues:
             issues_lines.append(
-                f"- [{issue.get('severity', '?')}] \"{seg.get('text', '')}\" → "
-                f"{issue.get('description', '')} "
-                f"(suggestion: {issue.get('suggestion', 'none')})"
+                f"- [{issue.severity}] \"{seg.text}\" → "
+                f"{issue.description} "
+                f"(suggestion: {issue.suggestion or 'none'})"
             )
 
     if not issues_lines:
@@ -164,19 +227,20 @@ def run_editor(transcription: str, critique: dict) -> dict:
 
     user_msg = EDITOR_USER_TEMPLATE.format(
         transcription=transcription,
-        confidence=critique.get("overall_confidence", "N/A"),
+        confidence=critique.overall_confidence,
         issues_text="\n".join(issues_lines),
     )
 
     print("  [editor] Fixing flagged issues...")
-    result = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg)
-    print(f"  [editor] Applied {len(result.get('changes', []))} fixes, {len(result.get('unresolved', []))} unresolved")
+    raw = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg)
 
-    # Ensure required fields
-    result.setdefault("corrected_text", transcription)
-    result.setdefault("changes", [])
-    result.setdefault("unresolved", [])
+    try:
+        result = EditorResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [editor] WARNING: output validation failed: {e}")
+        result = EditorResult(corrected_text=transcription)
 
+    print(f"  [editor] Applied {len(result.changes)} fixes, {len(result.unresolved)} unresolved")
     return result
 
 
@@ -222,11 +286,11 @@ Respond with ONLY a JSON object in this exact structure:
 }}"""
 
 
-def run_arbitrator(versions: list[dict]) -> dict:
+def run_arbitrator(versions: list[dict]) -> ArbitratorResult:
     """
     Run the Arbitrator Agent to merge multiple transcription versions.
     Each version dict should have: {text, source, score (optional)}
-    Returns structured dict with final_text, decisions, confidence, uncertain_segments.
+    Returns validated ArbitratorResult with final_text, decisions, confidence, uncertain_segments.
     """
     versions_text_parts = []
     for i, v in enumerate(versions, 1):
@@ -240,13 +304,15 @@ def run_arbitrator(versions: list[dict]) -> dict:
     )
 
     print(f"  [arbitrator] Comparing {len(versions)} versions...")
-    result = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg)
-    print(f"  [arbitrator] Merged (confidence {result.get('confidence', '?')})")
+    raw = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg)
 
-    # Ensure required fields
-    result.setdefault("final_text", versions[0]["text"] if versions else "")
-    result.setdefault("decisions", [])
-    result.setdefault("confidence", 0)
-    result.setdefault("uncertain_segments", [])
+    try:
+        result = ArbitratorResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [arbitrator] WARNING: output validation failed: {e}")
+        result = ArbitratorResult(
+            final_text=versions[0]["text"] if versions else "",
+        )
 
+    print(f"  [arbitrator] Merged (confidence {result.confidence})")
     return result

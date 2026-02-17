@@ -16,6 +16,7 @@ dependencies = [
     "verovio",
     "compressed-tensors",
     "python-dotenv",
+    "pydantic>=2.0",
     "requests",
     "opencv-python",
     "numpy",
