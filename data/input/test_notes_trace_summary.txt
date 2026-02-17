@@ -1,0 +1,8 @@
+[00:00] Preprocessed with 'deskew+high_contrast+binarize'
+[00:30] OCR pass (deskew+high_contrast+binarize) → 530 chars
+[00:31] Preprocessed with 'high_contrast+binarize'
+[00:40] OCR pass (high_contrast+binarize) → 530 chars
+[00:40] Versions agree 100.0%
+[00:40] Merged → 528 chars
+[01:17] Critic: confidence 92, verdict=needs_editing (2 issues: 1 critical, 0 minor, 1 cosmetic)
+[01:17] DONE — 1 iterations, final confidence 92
