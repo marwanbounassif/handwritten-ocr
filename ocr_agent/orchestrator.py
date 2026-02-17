@@ -6,7 +6,7 @@ A deterministic state machine — NOT an LLM. Manages the workflow loop.
 from dataclasses import dataclass, field
 
 from ocr_agent import config
-from ocr_agent.agents import run_arbitrator, run_critic, run_editor
+from ocr_agent.agents import CriticResult, run_arbitrator, run_critic, run_editor
 from ocr_agent.tools import (
     compare_versions,
     merge_versions,
@@ -95,7 +95,7 @@ def run_pipeline(
 
     # ── PHASE 2: CRITIQUE-EDIT LOOP ──────────────────────────────
     print("\n=== PHASE 2: Critique-Edit Loop ===")
-    prev_critique = None
+    prev_critique: CriticResult | None = None
 
     while state.status == "running" and state.iteration < max_iter:
         state.iteration += 1
@@ -103,22 +103,22 @@ def run_pipeline(
 
         # CRITIQUE
         critique = run_critic(state.current_best, previous_critique=prev_critique)
-        state.critiques.append(critique)
+        state.critiques.append(critique.model_dump())
 
-        confidence = critique.get("overall_confidence", 0)
-        verdict = critique.get("verdict", "needs_editing")
-        n_issues = sum(len(seg.get("issues", [])) for seg in critique.get("segments", []))
+        confidence = critique.overall_confidence
+        verdict = critique.verdict
+        n_issues = sum(len(seg.issues) for seg in critique.segments)
         n_critical = sum(
             1
-            for seg in critique.get("segments", [])
-            for issue in seg.get("issues", [])
-            if issue.get("severity") == "critical"
+            for seg in critique.segments
+            for issue in seg.issues
+            if issue.severity == "critical"
         )
         n_minor = sum(
             1
-            for seg in critique.get("segments", [])
-            for issue in seg.get("issues", [])
-            if issue.get("severity") == "minor"
+            for seg in critique.segments
+            for issue in seg.issues
+            if issue.severity == "minor"
         )
         n_cosmetic = n_issues - n_critical - n_minor
 
@@ -132,7 +132,7 @@ def run_pipeline(
                 f"({n_issues} issues: {n_critical} critical, {n_minor} minor, {n_cosmetic} cosmetic)"
             ),
             full_input={"transcription": state.current_best},
-            full_output=critique,
+            full_output=critique.model_dump(),
             metrics={
                 "confidence": confidence,
                 "n_issues": n_issues,
@@ -205,10 +205,10 @@ def run_pipeline(
 
         # NEEDS_EDITING path
         edit_result = run_editor(state.current_best, critique)
-        state.edits.append(edit_result)
+        state.edits.append(edit_result.model_dump())
 
-        n_changes = len(edit_result.get("changes", []))
-        n_unresolved = len(edit_result.get("unresolved", []))
+        n_changes = len(edit_result.changes)
+        n_unresolved = len(edit_result.unresolved)
 
         trace.log(
             iteration=state.iteration,
@@ -216,12 +216,12 @@ def run_pipeline(
             action="edit",
             input_summary=f"Transcription + {n_issues} critic issues",
             output_summary=f"Editor: fixed {n_changes} issues, {n_unresolved} unresolved",
-            full_input={"transcription": state.current_best, "critique": critique},
-            full_output=edit_result,
+            full_input={"transcription": state.current_best, "critique": critique.model_dump()},
+            full_output=edit_result.model_dump(),
             metrics={"changes_made": n_changes, "unresolved": n_unresolved},
         )
 
-        state.current_best = edit_result.get("corrected_text", state.current_best)
+        state.current_best = edit_result.corrected_text
         prev_critique = critique
 
     # Max iterations reached
@@ -335,16 +335,16 @@ def _handle_reocr(
         action="arbitrate",
         input_summary=f"Current best vs {new_candidate['source']}",
         output_summary=(
-            f"Arbitrator: merged with confidence {arb_result.get('confidence', '?')}, "
-            f"{len(arb_result.get('uncertain_segments', []))} uncertain segments"
+            f"Arbitrator: merged with confidence {arb_result.confidence}, "
+            f"{len(arb_result.uncertain_segments)} uncertain segments"
         ),
-        full_output=arb_result,
+        full_output=arb_result.model_dump(),
         metrics={
-            "confidence": arb_result.get("confidence", 0),
-            "n_decisions": len(arb_result.get("decisions", [])),
-            "n_uncertain": len(arb_result.get("uncertain_segments", [])),
+            "confidence": arb_result.confidence,
+            "n_decisions": len(arb_result.decisions),
+            "n_uncertain": len(arb_result.uncertain_segments),
         },
     )
 
-    state.current_best = arb_result.get("final_text", state.current_best)
+    state.current_best = arb_result.final_text
     return True

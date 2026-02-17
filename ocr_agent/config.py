@@ -4,15 +4,13 @@ All tuneable parameters live here.
 """
 
 # ── LLM Configuration ─────────────────────────────────────────────
-OPENAI_BASE_URL = "http://localhost:11434/v1"
-OPENAI_API_KEY = "ollama"
-OPENAI_MODEL = "qwen3:32b"
+# The ollama package reads OLLAMA_HOST from the environment automatically (default: http://localhost:11434)
+OLLAMA_MODEL = "qwen3:32b"
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 4096
 LLM_TIMEOUT = 300  # seconds
 LLM_STREAM = True             # stream responses (shows live output, avoids timeouts on slow models)
-LLM_ENABLE_THINKING = True    # Qwen3 thinking mode — model reasons in <think> tags before answering
-LLM_STOP_SEQUENCES = []       # optional stop sequences, e.g. ["\n\n", "IN:"]
+LLM_ENABLE_THINKING = False   # Qwen3 thinking mode — ollama separates reasoning into message.thinking
 
 # ── OCR Model Configuration ──────────────────────────────────────
 OLMOCR_MODEL = "allenai/olmOCR-2-7B-1025"
@@ -29,7 +27,8 @@ AGREEMENT_THRESHOLD = 80        # % agreement below which a tiebreaker OCR pass 
 # Each entry is either a single transform string or a list of transforms applied in order.
 # The orchestrator tries them top-to-bottom: first two as the initial reads, then extras on re-OCR.
 PREPROCESSING_STRATEGIES = [
-    "original",
+    ["deskew", "high_contrast", "binarize"],           
+    ["high_contrast", "binarize" ],                   
     ["deskew", "high_contrast", "sharpen"],           # best general pipeline for phone photos
     ["deskew", "denoise", "high_contrast"],            # noisy / low-light photos
     ["deskew", "remove_lines", "high_contrast"],       # lined notebook paper

@@ -3,7 +3,128 @@ LLM agent definitions for the agentic OCR pipeline.
 Each agent is an LLM call to Qwen3 via a specific system prompt with structured JSON output.
 """
 
+import json
+import re
+from typing import Literal, get_args, get_origin
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from ocr_agent.tools import call_llm_json
+
+
+# ── Pydantic schemas for agent outputs ───────────────────────────
+
+
+class CriticIssue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    description: str = ""
+    severity: Literal["critical", "minor", "cosmetic"] = "minor"
+    suggestion: str = ""
+
+
+class CriticSegment(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    text: str = ""
+    confidence: int = Field(default=50, ge=0, le=100)
+    issues: list[CriticIssue] = []
+
+
+class CriticResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    overall_confidence: int = Field(default=0, ge=0, le=100)
+    segments: list[CriticSegment] = []
+    verdict: Literal["accept", "needs_editing", "needs_reocr"] = "needs_editing"
+    reasoning: str = ""
+
+
+class EditorChange(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    original: str = ""
+    corrected: str = ""
+    reason: str = ""
+    confidence: int = Field(default=50, ge=0, le=100)
+
+
+class EditorResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    corrected_text: str
+    changes: list[EditorChange] = []
+    unresolved: list[str] = []
+
+
+class ArbitratorDecision(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    segment: str = ""
+    chosen_version: int = Field(default=1, ge=1)
+    reason: str = ""
+
+
+class ArbitratorResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    final_text: str
+    decisions: list[ArbitratorDecision] = []
+    confidence: int = Field(default=0, ge=0, le=100)
+    uncertain_segments: list[str] = []
+
+
+# ── Schema → prompt helper ────────────────────────────────────────
+
+
+_MARKER = "\u00a7"  # § sentinel stripped after json.dumps
+
+
+def _placeholder(annotation, field_info=None) -> object:
+    """Return a representative placeholder value for a type annotation."""
+    origin = get_origin(annotation)
+
+    # Literal["a", "b", "c"] → marker-wrapped so we can unescape later
+    if origin is Literal:
+        return _MARKER + " | ".join(f'"{v}"' for v in get_args(annotation)) + _MARKER
+
+    # list[X] → [placeholder(X)]
+    if origin is list:
+        (inner,) = get_args(annotation)
+        return [_placeholder(inner)]
+
+    # Pydantic sub-model → recurse
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _model_example(annotation)
+
+    # int with ge/le constraints → "<ge-le>"
+    if annotation is int and field_info is not None:
+        meta = field_info.metadata
+        ge = next((m.ge for m in meta if hasattr(m, "ge") and m.ge is not None), None)
+        le = next((m.le for m in meta if hasattr(m, "le") and m.le is not None), None)
+        if ge is not None and le is not None:
+            return _MARKER + f"<{ge}-{le}>" + _MARKER
+
+    if annotation is int:
+        return _MARKER + "<integer>" + _MARKER
+    if annotation is str:
+        return _MARKER + "<string>" + _MARKER
+
+    return _MARKER + "<value>" + _MARKER
+
+
+def _model_example(model: type[BaseModel]) -> dict:
+    """Build an example dict for a Pydantic model using field metadata."""
+    example = {}
+    for name, field_info in model.model_fields.items():
+        example[name] = _placeholder(field_info.annotation, field_info)
+    return example
+
+
+def schema_example(model: type[BaseModel]) -> str:
+    """Generate a human-readable JSON example from a Pydantic model class."""
+    raw = json.dumps(_model_example(model), indent=2, ensure_ascii=False)
+    # Strip the surrounding quotes and unescape inner quotes around markers
+    raw = re.sub(
+        r'"' + _MARKER + r'(.*?)' + _MARKER + r'"',
+        lambda m: m.group(1).replace('\\"', '"'),
+        raw,
+    )
+    return raw
+
 
 # ── Critic Agent ──────────────────────────────────────────────────
 
@@ -40,25 +161,8 @@ Analyze the following OCR transcription for errors and quality issues.
 {previous_critique_section}
 
 ## Output format
-Respond with ONLY a JSON object in this exact structure:
-{{
-  "overall_confidence": <0-100>,
-  "segments": [
-    {{
-      "text": "<the problematic text>",
-      "confidence": <0-100>,
-      "issues": [
-        {{
-          "description": "<what's wrong>",
-          "severity": "critical" | "minor" | "cosmetic",
-          "suggestion": "<what it should probably be>"
-        }}
-      ]
-    }}
-  ],
-  "verdict": "accept" | "needs_editing" | "needs_reocr",
-  "reasoning": "<brief explanation of the verdict>"
-}}
+Respond with ONLY a JSON object matching this schema:
+{schema}
 
 Guidelines for verdict:
 - "accept": text is coherent and readable, no critical issues, confidence > 85
@@ -66,35 +170,41 @@ Guidelines for verdict:
 - "needs_reocr": text is so garbled that linguistic correction alone won't recover it"""
 
 
-def run_critic(transcription: str, previous_critique: dict | None = None) -> dict:
+def run_critic(transcription: str, previous_critique: "CriticResult | None" = None) -> CriticResult:
     """
     Run the Critic Agent on a transcription.
-    Returns structured dict with confidence, segments, verdict, reasoning.
+    Returns validated CriticResult with confidence, segments, verdict, reasoning.
     """
     previous_section = ""
     if previous_critique:
         previous_section = (
             "## Previous Critique (for context — the text was edited since)\n"
-            f"Previous confidence: {previous_critique.get('overall_confidence', 'N/A')}\n"
-            f"Previous verdict: {previous_critique.get('verdict', 'N/A')}\n"
-            f"Previous reasoning: {previous_critique.get('reasoning', 'N/A')}"
+            f"Previous confidence: {previous_critique.overall_confidence}\n"
+            f"Previous verdict: {previous_critique.verdict}\n"
+            f"Previous reasoning: {previous_critique.reasoning}"
         )
 
     user_msg = CRITIC_USER_TEMPLATE.format(
         transcription=transcription,
         previous_critique_section=previous_section,
+        schema=schema_example(CriticResult),
     )
 
     print("  [critic] Analyzing transcription...")
-    result = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg)
-    print(f"  [critic] Verdict: {result.get('verdict', '?')} (confidence {result.get('overall_confidence', '?')})")
+    raw = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg,
+                        json_schema=CriticResult.model_json_schema())
 
-    # Ensure required fields exist with safe defaults
-    result.setdefault("overall_confidence", 0)
-    result.setdefault("segments", [])
-    result.setdefault("verdict", "needs_editing")
-    result.setdefault("reasoning", "")
+    try:
+        result = CriticResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [critic] WARNING: output validation failed: {e}")
+        result = CriticResult(
+            overall_confidence=0,
+            verdict="needs_editing",
+            reasoning="LLM output failed schema validation",
+        )
 
+    print(f"  [critic] Verdict: {result.verdict} (confidence {result.overall_confidence})")
     return result
 
 
@@ -125,38 +235,25 @@ Issues found:
 {issues_text}
 
 ## Output format
-Respond with ONLY a JSON object in this exact structure:
-{{
-  "corrected_text": "<the full corrected transcription>",
-  "changes": [
-    {{
-      "original": "<original problematic text>",
-      "corrected": "<what you changed it to>",
-      "reason": "<why this change>",
-      "confidence": <0-100>
-    }}
-  ],
-  "unresolved": [
-    "<description of issues you couldn't confidently fix>"
-  ]
-}}
+Respond with ONLY a JSON object matching this schema:
+{schema}
 
 IMPORTANT: The corrected_text must be the COMPLETE transcription with fixes applied, not just the changed parts."""
 
 
-def run_editor(transcription: str, critique: dict) -> dict:
+def run_editor(transcription: str, critique: CriticResult) -> EditorResult:
     """
     Run the Editor Agent to fix issues identified by the Critic.
-    Returns structured dict with corrected_text, changes, unresolved.
+    Returns validated EditorResult with corrected_text, changes, unresolved.
     """
     # Format issues for the editor
     issues_lines = []
-    for seg in critique.get("segments", []):
-        for issue in seg.get("issues", []):
+    for seg in critique.segments:
+        for issue in seg.issues:
             issues_lines.append(
-                f"- [{issue.get('severity', '?')}] \"{seg.get('text', '')}\" → "
-                f"{issue.get('description', '')} "
-                f"(suggestion: {issue.get('suggestion', 'none')})"
+                f"- [{issue.severity}] \"{seg.text}\" → "
+                f"{issue.description} "
+                f"(suggestion: {issue.suggestion or 'none'})"
             )
 
     if not issues_lines:
@@ -164,19 +261,22 @@ def run_editor(transcription: str, critique: dict) -> dict:
 
     user_msg = EDITOR_USER_TEMPLATE.format(
         transcription=transcription,
-        confidence=critique.get("overall_confidence", "N/A"),
+        confidence=critique.overall_confidence,
         issues_text="\n".join(issues_lines),
+        schema=schema_example(EditorResult),
     )
 
     print("  [editor] Fixing flagged issues...")
-    result = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg)
-    print(f"  [editor] Applied {len(result.get('changes', []))} fixes, {len(result.get('unresolved', []))} unresolved")
+    raw = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg,
+                        json_schema=EditorResult.model_json_schema())
 
-    # Ensure required fields
-    result.setdefault("corrected_text", transcription)
-    result.setdefault("changes", [])
-    result.setdefault("unresolved", [])
+    try:
+        result = EditorResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [editor] WARNING: output validation failed: {e}")
+        result = EditorResult(corrected_text=transcription)
 
+    print(f"  [editor] Applied {len(result.changes)} fixes, {len(result.unresolved)} unresolved")
     return result
 
 
@@ -205,28 +305,15 @@ Compare these OCR transcription versions and produce the best merged result.
 {versions_text}
 
 ## Output format
-Respond with ONLY a JSON object in this exact structure:
-{{
-  "final_text": "<the best merged transcription>",
-  "decisions": [
-    {{
-      "segment": "<the text segment in question>",
-      "chosen_version": <version number, 1-indexed>,
-      "reason": "<why this version's reading is better>"
-    }}
-  ],
-  "confidence": <0-100>,
-  "uncertain_segments": [
-    "<segments where no version was convincing>"
-  ]
-}}"""
+Respond with ONLY a JSON object matching this schema:
+{schema}"""
 
 
-def run_arbitrator(versions: list[dict]) -> dict:
+def run_arbitrator(versions: list[dict]) -> ArbitratorResult:
     """
     Run the Arbitrator Agent to merge multiple transcription versions.
     Each version dict should have: {text, source, score (optional)}
-    Returns structured dict with final_text, decisions, confidence, uncertain_segments.
+    Returns validated ArbitratorResult with final_text, decisions, confidence, uncertain_segments.
     """
     versions_text_parts = []
     for i, v in enumerate(versions, 1):
@@ -236,17 +323,21 @@ def run_arbitrator(versions: list[dict]) -> dict:
         )
 
     user_msg = ARBITRATOR_USER_TEMPLATE.format(
-        versions_text="\n\n".join(versions_text_parts)
+        versions_text="\n\n".join(versions_text_parts),
+        schema=schema_example(ArbitratorResult),
     )
 
     print(f"  [arbitrator] Comparing {len(versions)} versions...")
-    result = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg)
-    print(f"  [arbitrator] Merged (confidence {result.get('confidence', '?')})")
+    raw = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg,
+                        json_schema=ArbitratorResult.model_json_schema())
 
-    # Ensure required fields
-    result.setdefault("final_text", versions[0]["text"] if versions else "")
-    result.setdefault("decisions", [])
-    result.setdefault("confidence", 0)
-    result.setdefault("uncertain_segments", [])
+    try:
+        result = ArbitratorResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [arbitrator] WARNING: output validation failed: {e}")
+        result = ArbitratorResult(
+            final_text=versions[0]["text"] if versions else "",
+        )
 
+    print(f"  [arbitrator] Merged (confidence {result.confidence})")
     return result

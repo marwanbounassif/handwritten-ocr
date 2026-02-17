@@ -141,12 +141,9 @@ def tier1_metrics(ground_truth: str, ocr_output: str, lower: bool = False) -> di
 
 # ── LLM Helper ───────────────────────────────────────────────────
 
-import requests
+import sys
 
-
-def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> blocks from the response, returning only the final answer."""
-    return re.sub(r"<think>[\s\S]*?</think>\s*", "", text).strip()
+import ollama
 
 
 def call_llm(
@@ -155,11 +152,11 @@ def call_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
     stream: bool | None = None,
-    stop: list[str] | None = None,
 ) -> str:
     """
-    Call an OpenAI-compatible chat endpoint. Returns the assistant message text.
-    Supports streaming and Qwen3 thinking mode (<think> tags are stripped from output).
+    Call Ollama chat endpoint. Returns the assistant message text.
+    Thinking mode is controlled via ollama's native `think` parameter —
+    when enabled, reasoning goes into message.thinking and content stays clean.
     """
     messages = []
     if system_prompt:
@@ -167,86 +164,44 @@ def call_llm(
     messages.append({"role": "user", "content": user_message})
 
     should_stream = stream if stream is not None else config.LLM_STREAM
-    stop_seqs = stop if stop is not None else config.LLM_STOP_SEQUENCES
+    temp = temperature if temperature is not None else config.LLM_TEMPERATURE
+    options = {"temperature": temp, "num_predict": max_tokens or config.LLM_MAX_TOKENS}
 
-    body: dict = {
-        "model": config.OPENAI_MODEL,
-        "messages": messages,
-        "temperature": temperature if temperature is not None else config.LLM_TEMPERATURE,
-        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-        "stream": should_stream,
-    }
-    if stop_seqs:
-        body["stop"] = stop_seqs
-
-    print(f"  [llm] Calling {config.OPENAI_MODEL}...", flush=True)
+    print(f"  [llm] Calling {config.OLLAMA_MODEL}...", flush=True)
 
     if should_stream:
-        text = _call_llm_stream(body)
+        text = _call_llm_stream(messages, options)
     else:
-        resp = requests.post(
-            f"{config.OPENAI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-            json=body,
-            timeout=config.LLM_TIMEOUT,
+        response = ollama.chat(
+            model=config.OLLAMA_MODEL,
+            messages=messages,
+            options=options,
+            think=config.LLM_ENABLE_THINKING,
         )
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
-
-    # Strip thinking blocks if present
-    if config.LLM_ENABLE_THINKING:
-        text = _strip_think_tags(text)
+        text = response["message"]["content"]
 
     print(f"  [llm] Done ({len(text)} chars)")
     return text
 
 
-def _call_llm_stream(body: dict) -> str:
+def _call_llm_stream(messages: list[dict], options: dict) -> str:
     """Stream an LLM response, printing tokens live. Returns the full assembled text."""
-    import sys
-
-    resp = requests.post(
-        f"{config.OPENAI_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-        json=body,
-        timeout=config.LLM_TIMEOUT,
-        stream=True,
-    )
-    resp.raise_for_status()
-
     chunks: list[str] = []
-    in_think = False
 
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-        payload = line[len("data: "):]
-        if payload.strip() == "[DONE]":
-            break
-        try:
-            delta = json.loads(payload)["choices"][0]["delta"]
-        except (json.JSONDecodeError, KeyError, IndexError):
-            continue
-        token = delta.get("content", "")
+    for part in ollama.chat(
+        model=config.OLLAMA_MODEL,
+        messages=messages,
+        stream=True,
+        options=options,
+        think=config.LLM_ENABLE_THINKING,
+    ):
+        token = part["message"]["content"]
         if not token:
             continue
 
         chunks.append(token)
-
-        # Live-print non-thinking tokens so the user sees progress
-        if config.LLM_ENABLE_THINKING:
-            partial = "".join(chunks)
-            if not in_think and "<think>" in partial:
-                in_think = True
-            if in_think and "</think>" in partial:
-                in_think = False
-                continue
-            if not in_think and not partial.rstrip().endswith("<think>"):
-                sys.stdout.write(token)
-                sys.stdout.flush()
-        else:
-            sys.stdout.write(token)
-            sys.stdout.flush()
+        sys.stdout.write(token)
+        sys.stdout.flush()
 
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -293,11 +248,38 @@ def call_llm_json(
     user_message: str,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_schema: dict | None = None,
 ) -> dict:
     """
-    Call LLM and parse JSON response. Retries once with a nudge if parsing fails.
+    Call LLM and parse JSON response.
+    If json_schema is provided, uses ollama's format parameter for structured output.
+    Otherwise falls back to text parsing with retry.
     Returns parsed dict, or a fallback error dict.
     """
+    if json_schema is not None:
+        # Use ollama's native structured output
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_message})
+
+        temp = temperature if temperature is not None else config.LLM_TEMPERATURE
+        options = {"temperature": temp, "num_predict": max_tokens or config.LLM_MAX_TOKENS}
+
+        print(f"  [llm] Calling {config.OLLAMA_MODEL} (structured)...", flush=True)
+        response = ollama.chat(
+            model=config.OLLAMA_MODEL,
+            messages=messages,
+            format=json_schema,
+            options=options,
+            think=config.LLM_ENABLE_THINKING,
+        )
+        text = response["message"]["content"]
+        result = parse_json_response(text)
+        if result is not None:
+            return result
+
+    # Fallback: free-text call with JSON parsing
     raw = call_llm(system_prompt, user_message, temperature, max_tokens)
     result = parse_json_response(raw)
     if result is not None:
@@ -317,76 +299,24 @@ def call_llm_json(
     return {"error": "json_parse_failed", "raw_response": raw}
 
 
-# ── LLM Evaluation Prompt (from eval notebook) ───────────────────
-
-LLM_EVAL_PROMPT = """# OCR Post-Processing
-
-You are deciphering a corrupted text. The original meaning is hidden under OCR damage. Your job is to recover it.
-
-## Rules
-1. **The meaning already exists** — you are revealing it, not creating it. Never paraphrase or inject new ideas.
-2. **Noise characters/words are common** — OCR inserts random letters, splits words, or merges them. Single letters or fragments that make no grammatical sense (like a stray "y" or "a") are likely noise or remnants of a real word.
-3. **Corruption can be severe** — a word may be completely unrecognizable. Infer it from:
-   - Grammar: What part of speech must fit here?
-   - Context: What are the surrounding words talking about?
-   - Letter traces: Any surviving letters that hint at the original? (e.g. "Hergy" → "therapy", "alio" → "aliz")
-4. **Adjacent fragments often form one word** — look for split words that reconstruct when merged (e.g. "inter alio ing" → "internalizing").
-5. **Preserve everything that isn't damaged** — keep original punctuation intent, sentence structure, and word order.
-
-## Example
-Input: The irony is, that most a y these people will be in Hergy, inter alio ing eve y thing
-Output: The irony is, that most of these people will be in therapy, internalizing everything
-
-Notice: "a y" → "of" (noise fragments replaced by contextually correct word), "Hergy" → "therapy" (letter traces + context), "inter alio ing" → "internalizing" (fragments merged), "eve y thing" → "everything" (noise letter removed).
-
-## Input
-{ocr_text}
-
-## Output format
-Respond with ONLY the corrected text. No preamble, no explanations, no labels, no markdown formatting. Just the clean corrected text and nothing else."""
-
-
-def tier23_llm_eval(ocr_output: str) -> str:
-    """Single LLM call: correct OCR output. Returns corrected text string."""
-    print("  [eval] Running LLM correction...")
-    prompt = LLM_EVAL_PROMPT.format(ocr_text=ocr_output)
-    result = call_llm("", prompt)
-    print(f"  [eval] LLM correction done ({len(result)} chars)")
-    return result
-
-
-# ── Full Evaluation Pipeline ─────────────────────────────────────
+# ── Evaluation ────────────────────────────────────────────────────
 
 
 def evaluate(
     transcription: str,
     ground_truth: str | None = None,
     lower: bool = False,
-    text_eval_only: bool = False,
 ) -> dict:
     """
-    Full evaluation: CER/WER if ground_truth provided, plus LLM scoring/correction.
-    Returns structured dict with all metrics and corrected text.
+    Compute hard metrics (CER/WER) against ground truth.
+    Returns structured dict with tier-1 metrics.
     """
     result = {}
-    print("  [eval] Starting evaluation...")
 
-    # Tier 1: hard metrics against ground truth
     if ground_truth is not None:
         print("  [eval] Computing CER/WER against ground truth...")
         result["tier1_raw_vs_gt"] = tier1_metrics(ground_truth, transcription, lower)
 
-    if not text_eval_only:
-        # Tier 2+3: LLM correction
-        corrected = tier23_llm_eval(transcription)
-        result["corrected_text"] = corrected
-
-        # Tier 1 on corrected text vs ground truth (did correction help?)
-        if ground_truth is not None:
-            print("  [eval] Computing CER/WER on corrected text...")
-            result["tier1_corrected_vs_gt"] = tier1_metrics(ground_truth, corrected, lower)
-
-    print("  [eval] Evaluation complete")
     return result
 
 
