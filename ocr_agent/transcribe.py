@@ -26,8 +26,12 @@ def transcribe_single(
     accept_threshold: int | None = None,
 ) -> Path:
     """Transcribe a single image and save all outputs. Returns the transcription path."""
-    from ocr_agent.orchestrator import run_pipeline
+    import time
+
+    from ocr_agent import config
+    from ocr_agent.graph import build_ocr_graph
     from ocr_agent.tools import evaluate, parse_ground_truth
+    from ocr_agent.trace import Trace
 
     name = image_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -36,16 +40,42 @@ def transcribe_single(
     print(f"Processing: {image_path.name}")
     print(f"{'='*60}")
 
-    # Run the pipeline
-    state, trace = run_pipeline(
-        image_path=str(image_path),
-        max_iterations=max_iterations,
-        accept_threshold=accept_threshold,
-    )
+    # Build initial state
+    initial_state = {
+        "image_path": str(image_path),
+        "candidates": [],
+        "critiques": [],
+        "edits": [],
+        "current_best": "",
+        "current_score": 0.0,
+        "iteration": 0,
+        "max_iterations": max_iterations or config.MAX_ITERATIONS,
+        "status": "running",
+        "reason": "",
+        "strategies_used": [],
+        "plateau_count": 0,
+        "prev_score": 0.0,
+        "prev_critique": None,
+        "config": {
+            "accept_threshold": accept_threshold or config.ACCEPT_THRESHOLD,
+            "plateau_patience": config.PLATEAU_PATIENCE,
+            "strategies": list(config.PREPROCESSING_STRATEGIES),
+            "agreement_threshold": config.AGREEMENT_THRESHOLD,
+        },
+        "trace_events": [],
+        "start_time": time.monotonic(),
+    }
+
+    # Run the graph
+    graph = build_ocr_graph()
+    final_state = graph.invoke(initial_state)
+
+    # Reconstruct Trace for saving
+    trace = Trace.from_events(final_state["trace_events"])
 
     # Save transcription
     transcription_path = output_dir / f"{name}_transcription.txt"
-    transcription_path.write_text(state.current_best, encoding="utf-8")
+    transcription_path.write_text(final_state["current_best"], encoding="utf-8")
     print(f"\nSaved: {transcription_path}")
 
     # Save trace
@@ -60,10 +90,10 @@ def transcribe_single(
     # Final evaluation (and GT comparison if provided)
     ground_truth = parse_ground_truth(ground_truth_path) if ground_truth_path else None
 
-    eval_result = evaluate(state.current_best, ground_truth=ground_truth)
-    eval_result["pipeline_status"] = state.status
-    eval_result["iterations"] = state.iteration
-    eval_result["final_confidence"] = state.current_score
+    eval_result = evaluate(final_state["current_best"], ground_truth=ground_truth)
+    eval_result["pipeline_status"] = final_state["status"]
+    eval_result["iterations"] = final_state["iteration"]
+    eval_result["final_confidence"] = final_state["current_score"]
 
     eval_path = output_dir / f"{name}_eval.json"
     with open(eval_path, "w", encoding="utf-8") as f:
@@ -72,10 +102,10 @@ def transcribe_single(
 
     # Print summary
     print(f"\n--- Result ---")
-    print(f"Status: {state.status}")
-    print(f"Iterations: {state.iteration}")
-    print(f"Final confidence: {state.current_score}")
-    print(f"Transcription length: {len(state.current_best)} chars")
+    print(f"Status: {final_state['status']}")
+    print(f"Iterations: {final_state['iteration']}")
+    print(f"Final confidence: {final_state['current_score']}")
+    print(f"Transcription length: {len(final_state['current_best'])} chars")
     if ground_truth:
         raw = eval_result.get("tier1_raw_vs_gt", {})
         print(f"CER vs GT: {raw.get('cer', 'N/A')}")

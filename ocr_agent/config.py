@@ -4,15 +4,13 @@ All tuneable parameters live here.
 """
 
 # ── LLM Configuration ─────────────────────────────────────────────
-OPENAI_BASE_URL = "http://localhost:11434/v1"
-OPENAI_API_KEY = "ollama"
-OPENAI_MODEL = "qwen3:32b"
+# The ollama package reads OLLAMA_HOST from the environment automatically (default: http://localhost:11434)
+OLLAMA_MODEL = "qwen3:32b"
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 4096
 LLM_TIMEOUT = 300  # seconds
 LLM_STREAM = True             # stream responses (shows live output, avoids timeouts on slow models)
-LLM_ENABLE_THINKING = True    # Qwen3 thinking mode — model reasons in <think> tags before answering
-LLM_STOP_SEQUENCES = []       # optional stop sequences, e.g. ["\n\n", "IN:"]
+LLM_ENABLE_THINKING = False   # Qwen3 thinking mode — ollama separates reasoning into message.thinking
 
 # ── OCR Model Configuration ──────────────────────────────────────
 OLMOCR_MODEL = "allenai/olmOCR-2-7B-1025"

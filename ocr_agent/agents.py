@@ -145,7 +145,8 @@ def run_critic(transcription: str, previous_critique: "CriticResult | None" = No
     )
 
     print("  [critic] Analyzing transcription...")
-    raw = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg)
+    raw = call_llm_json(CRITIC_SYSTEM_PROMPT, user_msg,
+                        json_schema=CriticResult.model_json_schema())
 
     try:
         result = CriticResult.model_validate(raw)
@@ -232,7 +233,8 @@ def run_editor(transcription: str, critique: CriticResult) -> EditorResult:
     )
 
     print("  [editor] Fixing flagged issues...")
-    raw = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg)
+    raw = call_llm_json(EDITOR_SYSTEM_PROMPT, user_msg,
+                        json_schema=EditorResult.model_json_schema())
 
     try:
         result = EditorResult.model_validate(raw)
@@ -304,7 +306,8 @@ def run_arbitrator(versions: list[dict]) -> ArbitratorResult:
     )
 
     print(f"  [arbitrator] Comparing {len(versions)} versions...")
-    raw = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg)
+    raw = call_llm_json(ARBITRATOR_SYSTEM_PROMPT, user_msg,
+                        json_schema=ArbitratorResult.model_json_schema())
 
     try:
         result = ArbitratorResult.model_validate(raw)

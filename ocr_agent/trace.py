@@ -73,3 +73,10 @@ class Trace:
         for e in self.events:
             elapsed = self._format_elapsed(e["elapsed_seconds"])
             print(f"[{elapsed}] {e['output_summary']}")
+
+    @classmethod
+    def from_events(cls, events: list[dict]) -> "Trace":
+        """Reconstruct a Trace from a list of pre-built event dicts."""
+        trace = cls()
+        trace.events = list(events)
+        return trace
