@@ -27,7 +27,8 @@ AGREEMENT_THRESHOLD = 80        # % agreement below which a tiebreaker OCR pass 
 # Each entry is either a single transform string or a list of transforms applied in order.
 # The orchestrator tries them top-to-bottom: first two as the initial reads, then extras on re-OCR.
 PREPROCESSING_STRATEGIES = [
-    "original",
+    ["deskew", "high_contrast", "binarize"],           
+    ["high_contrast", "binarize" ],                   
     ["deskew", "high_contrast", "sharpen"],           # best general pipeline for phone photos
     ["deskew", "denoise", "high_contrast"],            # noisy / low-light photos
     ["deskew", "remove_lines", "high_contrast"],       # lined notebook paper

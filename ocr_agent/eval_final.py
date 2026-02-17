@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Standalone evaluation script for verifying transcription quality.
-Uses the same evaluate() function the agents use internally.
+Computes hard metrics (CER/WER) against ground truth.
 
 Usage:
     python -m ocr_agent.eval_final path/to/transcription.txt --ground-truth path/to/gt.md
-    python -m ocr_agent.eval_final results/ --ground-truth-dir gt/ --image-dir images/
+    python -m ocr_agent.eval_final results/ --ground-truth-dir gt/
 """
 
 import argparse
@@ -17,16 +17,15 @@ from pathlib import Path
 def eval_single(
     transcription_path: Path,
     ground_truth_path: Path | None = None,
-    text_eval_only: bool = False,
 ) -> dict:
     """Evaluate a single transcription file."""
-    from ocr_agent.tools import evaluate, parse_ground_truth, tier1_metrics
+    from ocr_agent.tools import evaluate, parse_ground_truth
 
     transcription = transcription_path.read_text(encoding="utf-8")
 
     ground_truth = parse_ground_truth(ground_truth_path) if ground_truth_path else None
 
-    result = evaluate(transcription, ground_truth=ground_truth, text_eval_only=text_eval_only)
+    result = evaluate(transcription, ground_truth=ground_truth)
     result["file"] = str(transcription_path)
     return result
 
@@ -44,24 +43,6 @@ def print_eval(result: dict, name: str):
         print(f"    WER (tok): {t['wer_token']:.2%}")
         print(f"    Exact:     {t['exact_match']}")
         print(f"    GT chars:  {t['gt_chars']}  |  OCR chars: {t['ocr_chars']}")
-
-    if "tier1_corrected_vs_gt" in result:
-        t2 = result["tier1_corrected_vs_gt"]
-        print(f"\n  Corrected vs Ground Truth:")
-        print(f"    CER:       {t2['cer']:.2%}")
-        print(f"    WER (tok): {t2['wer_token']:.2%}")
-        print(f"    Exact:     {t2['exact_match']}")
-
-        if "tier1_raw_vs_gt" in result:
-            delta_cer = result["tier1_raw_vs_gt"]["cer"] - t2["cer"]
-            delta_wer = result["tier1_raw_vs_gt"]["wer_token"] - t2["wer_token"]
-            direction = "improved" if delta_cer > 0 else "worse"
-            print(f"    Delta CER: {delta_cer:+.2%}  Delta WER: {delta_wer:+.2%}  ({direction})")
-
-    if "corrected_text" in result:
-        preview = result["corrected_text"][:300]
-        print(f"\n  Corrected text preview:")
-        print(f"    {preview}...")
 
 
 def main():
@@ -91,12 +72,6 @@ def main():
         default=None,
         help="Path to save evaluation JSON (default: print to stdout)",
     )
-    parser.add_argument(
-        "--text-eval-only",
-        action="store_true",
-        help="Evaluate text only, without calling LLM critic",
-    )
-
     args = parser.parse_args()
     input_path: Path = args.input.resolve()
 
@@ -106,7 +81,7 @@ def main():
 
     # Single file mode
     if input_path.is_file():
-        result = eval_single(input_path, args.ground_truth, args.text_eval_only)
+        result = eval_single(input_path, args.ground_truth)
         print_eval(result, input_path.name)
 
         if args.output:
@@ -139,8 +114,7 @@ def main():
                     gt_path = candidate
                     break
         
-        print(args)
-        result = eval_single(txt_path, gt_path, args.text_eval_only)
+        result = eval_single(txt_path, gt_path)
         print_eval(result, txt_path.name)
         all_results.append(result)
 

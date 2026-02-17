@@ -3,7 +3,9 @@ LLM agent definitions for the agentic OCR pipeline.
 Each agent is an LLM call to Qwen3 via a specific system prompt with structured JSON output.
 """
 
-from typing import Literal
+import json
+import re
+from typing import Literal, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -53,7 +55,7 @@ class EditorResult(BaseModel):
 class ArbitratorDecision(BaseModel):
     model_config = ConfigDict(extra="ignore")
     segment: str = ""
-    chosen_version: int = 1
+    chosen_version: int = Field(default=1, ge=1)
     reason: str = ""
 
 
@@ -63,6 +65,66 @@ class ArbitratorResult(BaseModel):
     decisions: list[ArbitratorDecision] = []
     confidence: int = Field(default=0, ge=0, le=100)
     uncertain_segments: list[str] = []
+
+
+# ── Schema → prompt helper ────────────────────────────────────────
+
+
+_MARKER = "\u00a7"  # § sentinel stripped after json.dumps
+
+
+def _placeholder(annotation, field_info=None) -> object:
+    """Return a representative placeholder value for a type annotation."""
+    origin = get_origin(annotation)
+
+    # Literal["a", "b", "c"] → marker-wrapped so we can unescape later
+    if origin is Literal:
+        return _MARKER + " | ".join(f'"{v}"' for v in get_args(annotation)) + _MARKER
+
+    # list[X] → [placeholder(X)]
+    if origin is list:
+        (inner,) = get_args(annotation)
+        return [_placeholder(inner)]
+
+    # Pydantic sub-model → recurse
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _model_example(annotation)
+
+    # int with ge/le constraints → "<ge-le>"
+    if annotation is int and field_info is not None:
+        meta = field_info.metadata
+        ge = next((m.ge for m in meta if hasattr(m, "ge") and m.ge is not None), None)
+        le = next((m.le for m in meta if hasattr(m, "le") and m.le is not None), None)
+        if ge is not None and le is not None:
+            return _MARKER + f"<{ge}-{le}>" + _MARKER
+
+    if annotation is int:
+        return _MARKER + "<integer>" + _MARKER
+    if annotation is str:
+        return _MARKER + "<string>" + _MARKER
+
+    return _MARKER + "<value>" + _MARKER
+
+
+def _model_example(model: type[BaseModel]) -> dict:
+    """Build an example dict for a Pydantic model using field metadata."""
+    example = {}
+    for name, field_info in model.model_fields.items():
+        example[name] = _placeholder(field_info.annotation, field_info)
+    return example
+
+
+def schema_example(model: type[BaseModel]) -> str:
+    """Generate a human-readable JSON example from a Pydantic model class."""
+    raw = json.dumps(_model_example(model), indent=2, ensure_ascii=False)
+    # Strip the surrounding quotes and unescape inner quotes around markers
+    raw = re.sub(
+        r'"' + _MARKER + r'(.*?)' + _MARKER + r'"',
+        lambda m: m.group(1).replace('\\"', '"'),
+        raw,
+    )
+    return raw
+
 
 # ── Critic Agent ──────────────────────────────────────────────────
 
@@ -99,25 +161,8 @@ Analyze the following OCR transcription for errors and quality issues.
 {previous_critique_section}
 
 ## Output format
-Respond with ONLY a JSON object in this exact structure:
-{{
-  "overall_confidence": <0-100>,
-  "segments": [
-    {{
-      "text": "<the problematic text>",
-      "confidence": <0-100>,
-      "issues": [
-        {{
-          "description": "<what's wrong>",
-          "severity": "critical" | "minor" | "cosmetic",
-          "suggestion": "<what it should probably be>"
-        }}
-      ]
-    }}
-  ],
-  "verdict": "accept" | "needs_editing" | "needs_reocr",
-  "reasoning": "<brief explanation of the verdict>"
-}}
+Respond with ONLY a JSON object matching this schema:
+{schema}
 
 Guidelines for verdict:
 - "accept": text is coherent and readable, no critical issues, confidence > 85
@@ -142,6 +187,7 @@ def run_critic(transcription: str, previous_critique: "CriticResult | None" = No
     user_msg = CRITIC_USER_TEMPLATE.format(
         transcription=transcription,
         previous_critique_section=previous_section,
+        schema=schema_example(CriticResult),
     )
 
     print("  [critic] Analyzing transcription...")
@@ -189,21 +235,8 @@ Issues found:
 {issues_text}
 
 ## Output format
-Respond with ONLY a JSON object in this exact structure:
-{{
-  "corrected_text": "<the full corrected transcription>",
-  "changes": [
-    {{
-      "original": "<original problematic text>",
-      "corrected": "<what you changed it to>",
-      "reason": "<why this change>",
-      "confidence": <0-100>
-    }}
-  ],
-  "unresolved": [
-    "<description of issues you couldn't confidently fix>"
-  ]
-}}
+Respond with ONLY a JSON object matching this schema:
+{schema}
 
 IMPORTANT: The corrected_text must be the COMPLETE transcription with fixes applied, not just the changed parts."""
 
@@ -230,6 +263,7 @@ def run_editor(transcription: str, critique: CriticResult) -> EditorResult:
         transcription=transcription,
         confidence=critique.overall_confidence,
         issues_text="\n".join(issues_lines),
+        schema=schema_example(EditorResult),
     )
 
     print("  [editor] Fixing flagged issues...")
@@ -271,21 +305,8 @@ Compare these OCR transcription versions and produce the best merged result.
 {versions_text}
 
 ## Output format
-Respond with ONLY a JSON object in this exact structure:
-{{
-  "final_text": "<the best merged transcription>",
-  "decisions": [
-    {{
-      "segment": "<the text segment in question>",
-      "chosen_version": <version number, 1-indexed>,
-      "reason": "<why this version's reading is better>"
-    }}
-  ],
-  "confidence": <0-100>,
-  "uncertain_segments": [
-    "<segments where no version was convincing>"
-  ]
-}}"""
+Respond with ONLY a JSON object matching this schema:
+{schema}"""
 
 
 def run_arbitrator(versions: list[dict]) -> ArbitratorResult:
@@ -302,7 +323,8 @@ def run_arbitrator(versions: list[dict]) -> ArbitratorResult:
         )
 
     user_msg = ARBITRATOR_USER_TEMPLATE.format(
-        versions_text="\n\n".join(versions_text_parts)
+        versions_text="\n\n".join(versions_text_parts),
+        schema=schema_example(ArbitratorResult),
     )
 
     print(f"  [arbitrator] Comparing {len(versions)} versions...")

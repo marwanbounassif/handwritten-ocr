@@ -299,76 +299,24 @@ def call_llm_json(
     return {"error": "json_parse_failed", "raw_response": raw}
 
 
-# ── LLM Evaluation Prompt (from eval notebook) ───────────────────
-
-LLM_EVAL_PROMPT = """# OCR Post-Processing
-
-You are deciphering a corrupted text. The original meaning is hidden under OCR damage. Your job is to recover it.
-
-## Rules
-1. **The meaning already exists** — you are revealing it, not creating it. Never paraphrase or inject new ideas.
-2. **Noise characters/words are common** — OCR inserts random letters, splits words, or merges them. Single letters or fragments that make no grammatical sense (like a stray "y" or "a") are likely noise or remnants of a real word.
-3. **Corruption can be severe** — a word may be completely unrecognizable. Infer it from:
-   - Grammar: What part of speech must fit here?
-   - Context: What are the surrounding words talking about?
-   - Letter traces: Any surviving letters that hint at the original? (e.g. "Hergy" → "therapy", "alio" → "aliz")
-4. **Adjacent fragments often form one word** — look for split words that reconstruct when merged (e.g. "inter alio ing" → "internalizing").
-5. **Preserve everything that isn't damaged** — keep original punctuation intent, sentence structure, and word order.
-
-## Example
-Input: The irony is, that most a y these people will be in Hergy, inter alio ing eve y thing
-Output: The irony is, that most of these people will be in therapy, internalizing everything
-
-Notice: "a y" → "of" (noise fragments replaced by contextually correct word), "Hergy" → "therapy" (letter traces + context), "inter alio ing" → "internalizing" (fragments merged), "eve y thing" → "everything" (noise letter removed).
-
-## Input
-{ocr_text}
-
-## Output format
-Respond with ONLY the corrected text. No preamble, no explanations, no labels, no markdown formatting. Just the clean corrected text and nothing else."""
-
-
-def tier23_llm_eval(ocr_output: str) -> str:
-    """Single LLM call: correct OCR output. Returns corrected text string."""
-    print("  [eval] Running LLM correction...")
-    prompt = LLM_EVAL_PROMPT.format(ocr_text=ocr_output)
-    result = call_llm("", prompt)
-    print(f"  [eval] LLM correction done ({len(result)} chars)")
-    return result
-
-
-# ── Full Evaluation Pipeline ─────────────────────────────────────
+# ── Evaluation ────────────────────────────────────────────────────
 
 
 def evaluate(
     transcription: str,
     ground_truth: str | None = None,
     lower: bool = False,
-    text_eval_only: bool = False,
 ) -> dict:
     """
-    Full evaluation: CER/WER if ground_truth provided, plus LLM scoring/correction.
-    Returns structured dict with all metrics and corrected text.
+    Compute hard metrics (CER/WER) against ground truth.
+    Returns structured dict with tier-1 metrics.
     """
     result = {}
-    print("  [eval] Starting evaluation...")
 
-    # Tier 1: hard metrics against ground truth
     if ground_truth is not None:
         print("  [eval] Computing CER/WER against ground truth...")
         result["tier1_raw_vs_gt"] = tier1_metrics(ground_truth, transcription, lower)
 
-    if not text_eval_only:
-        # Tier 2+3: LLM correction
-        corrected = tier23_llm_eval(transcription)
-        result["corrected_text"] = corrected
-
-        # Tier 1 on corrected text vs ground truth (did correction help?)
-        if ground_truth is not None:
-            print("  [eval] Computing CER/WER on corrected text...")
-            result["tier1_corrected_vs_gt"] = tier1_metrics(ground_truth, corrected, lower)
-
-    print("  [eval] Evaluation complete")
     return result
 
 
