@@ -32,12 +32,17 @@ def search_by_topic(
     client = get_client()
     dense_vecs = embed_dense([inferred_topic])
 
+    from qdrant_client.models import FieldCondition, Filter, Range
+
     results = client.query_points(
         collection_name=settings.COLLECTION_NAME,
         query=dense_vecs[0],
         using="text_dense",
         limit=top_k,
         with_payload=True,
+        query_filter=Filter(must=[
+            FieldCondition(key="confidence_score", range=Range(gt=0.0)),
+        ]),
     )
 
     logger.debug(

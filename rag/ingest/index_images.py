@@ -7,12 +7,16 @@ Text embeddings are added later via the annotation notebook.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import uuid
 from pathlib import Path
 
 from loguru import logger
 from PIL import Image
+from pillow_heif import register_heif_opener
+
+register_heif_opener()  # enables Image.open() on .heic/.heif files
 from qdrant_client.models import PointStruct, SparseVector
 
 from rag.client import get_client
@@ -23,51 +27,76 @@ from rag.schema import ensure_collection_exists
 # Deterministic UUID namespace — same as upsert.py for consistency
 _NAMESPACE = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 
-# Cropping defaults
-NUM_ROWS = 6
-OVERLAP_PX = 20
-MIN_CROP_HEIGHT = 80
+# Crop defaults
+NUM_CROPS = 12
+MIN_CROP_SIZE = 128
+
+# Scale range as fraction of the shorter image dimension
+SCALE_MIN = 0.15
+SCALE_MAX = 0.45
 
 # Zero vectors for placeholder text embeddings
 _ZERO_DENSE = [0.0] * 1024
 _ZERO_SPARSE = SparseVector(indices=[], values=[])
 
 
-def _make_row_crops(
-    img: Image.Image,
-    num_rows: int = NUM_ROWS,
-    overlap_px: int = OVERLAP_PX,
-) -> list[tuple[Image.Image, dict]]:
-    """Divide an image into horizontal strips.
+def _deterministic_random(source_image_id: str, num_crops: int, img_w: int, img_h: int):
+    """Generate deterministic pseudo-random crop parameters from image id.
 
-    Args:
-        img: Source PIL image.
-        num_rows: Number of horizontal strips.
-        overlap_px: Pixel overlap between adjacent strips.
-
-    Returns:
-        List of (crop_image, region_coords_dict) tuples.
-        region_coords has keys: x, y, w, h.
+    Uses a hash-seeded RNG so the same image always produces the same crops,
+    making the pipeline idempotent without needing to track state.
     """
-    w, h = img.size
-    base_height = h // num_rows
+    import random
+
+    seed = int(hashlib.sha256(source_image_id.encode()).hexdigest(), 16) % (2**32)
+    rng = random.Random(seed)
+
+    short_side = min(img_w, img_h)
     crops = []
-    for i in range(num_rows):
-        y_start = max(0, i * base_height - overlap_px)
-        y_end = min(h, (i + 1) * base_height + overlap_px)
-        if y_end - y_start < MIN_CROP_HEIGHT:
-            continue
-        crop = img.crop((0, y_start, w, y_end))
-        region = {"x": 0, "y": y_start, "w": w, "h": y_end - y_start}
-        crops.append((crop, region))
+    for _ in range(num_crops):
+        scale = rng.uniform(SCALE_MIN, SCALE_MAX)
+        crop_w = max(MIN_CROP_SIZE, int(img_w * scale))
+        crop_h = max(MIN_CROP_SIZE, int(img_h * scale))
+
+        # Clamp to image bounds
+        crop_w = min(crop_w, img_w)
+        crop_h = min(crop_h, img_h)
+
+        x = rng.randint(0, img_w - crop_w)
+        y = rng.randint(0, img_h - crop_h)
+        crops.append({"x": x, "y": y, "w": crop_w, "h": crop_h})
+
     return crops
 
 
-def _crop_to_base64(crop: Image.Image) -> str:
-    """Encode a PIL image crop as base64 PNG."""
-    buf = io.BytesIO()
-    crop.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+def make_random_crops(
+    img: Image.Image,
+    source_image_id: str,
+    num_crops: int = NUM_CROPS,
+) -> list[tuple[Image.Image, dict]]:
+    """Generate pseudo-random crops from an image.
+
+    Crops are deterministic per source_image_id so re-running produces
+    identical results. Varies both position and scale.
+
+    Args:
+        img: Source PIL image.
+        source_image_id: Used to seed the RNG for reproducibility.
+        num_crops: Number of crops to generate.
+
+    Returns:
+        List of (crop_image, region_coords_dict) tuples.
+    """
+    w, h = img.size
+    regions = _deterministic_random(source_image_id, num_crops, w, h)
+
+    results = []
+    for region in regions:
+        x, y, cw, ch = region["x"], region["y"], region["w"], region["h"]
+        crop = img.crop((x, y, x + cw, y + ch))
+        results.append((crop, region))
+
+    return results
 
 
 def _point_id(source_image_id: str, region_coords: dict) -> str:
@@ -77,24 +106,23 @@ def _point_id(source_image_id: str, region_coords: dict) -> str:
 
 def index_image(
     image_path: str | Path,
-    num_rows: int = NUM_ROWS,
-    overlap_px: int = OVERLAP_PX,
+    num_crops: int = 0,
     preprocessing: list[str] | None = None,
 ) -> int:
-    """Index a single image: preprocess, crop, CLIP embed, upsert to Qdrant.
+    """Index a single image: preprocess, optionally crop, CLIP embed, upsert to Qdrant.
 
-    Each crop is upserted with a visual embedding and empty text fields.
+    Each point is upserted with a visual embedding and empty text fields.
     Text embeddings are added later during manual annotation.
 
     Args:
         image_path: Path to the source image.
-        num_rows: Number of horizontal strips to divide the image into.
-        overlap_px: Pixel overlap between strips.
+        num_crops: Number of random crops to generate. 0 (default) indexes
+            the full image as a single point with no cropping.
         preprocessing: List of preprocessing transforms to apply.
-            Defaults to ["deskew", "high_contrast"].
+            Defaults to ["deskew", "high_contrast", "binarize"].
 
     Returns:
-        Number of crops indexed.
+        Number of points indexed.
     """
     from ocr_agent.tools import preprocess_image
 
@@ -102,13 +130,20 @@ def index_image(
     source_id = image_path.stem
 
     if preprocessing is None:
-        preprocessing = ["deskew", "high_contrast"]
+        preprocessing = ["deskew", "high_contrast", "binarize"]
 
     # Preprocess — returns path to temp file
     processed_path = preprocess_image(str(image_path), preprocessing)
-    processed_img = Image.open(processed_path).convert("RGB")
+    processed_img = Image.open(processed_path)
 
-    crops = _make_row_crops(processed_img, num_rows, overlap_px)
+    if num_crops > 0:
+        crops = make_random_crops(processed_img, source_id, num_crops)
+    else:
+        # Index the full image as a single point
+        w, h = processed_img.size
+        region = {"x": 0, "y": 0, "w": w, "h": h}
+        crops = [(processed_img, region)]
+
     if not crops:
         logger.warning("No crops generated for {}", image_path.name)
         return 0
@@ -120,7 +155,6 @@ def index_image(
     for crop_img, region in crops:
         pid = _point_id(source_id, region)
         visual_vec = embed_image(crop_img)
-        b64 = _crop_to_base64(crop_img)
 
         point = PointStruct(
             id=pid,
@@ -138,40 +172,34 @@ def index_image(
                 "topic_tags": [],
                 "chunk_type": "phrase",
                 "from_human_review": False,
-                "image_crop_base64": b64,
             },
         )
         points.append(point)
 
     client.upsert(collection_name=settings.COLLECTION_NAME, points=points)
-    logger.info(
-        "Indexed {} crops from {} into '{}'",
-        len(points),
-        image_path.name,
-        settings.COLLECTION_NAME,
-    )
+    label = f"{len(points)} crops" if num_crops > 0 else "full image"
+    logger.info("Indexed {} from {} into '{}'", label, image_path.name, settings.COLLECTION_NAME)
     return len(points)
 
 
 def index_all(
     local_dir: str | Path | None = None,
-    num_rows: int = NUM_ROWS,
-    overlap_px: int = OVERLAP_PX,
+    num_crops: int = 0,
     sync_s3: bool = True,
 ) -> int:
     """Index all images: optionally sync from S3, then index each.
 
     Idempotent — re-indexing the same image overwrites the same Qdrant points
-    thanks to deterministic UUIDs.
+    thanks to deterministic UUIDs seeded from the image filename.
 
     Args:
         local_dir: Directory containing images. Defaults to data/input/.
-        num_rows: Number of horizontal strips per image.
-        overlap_px: Pixel overlap between strips.
+        num_crops: Number of random crops per image. 0 (default) indexes
+            the full image as a single point with no cropping.
         sync_s3: If True, sync images from S3 before indexing.
 
     Returns:
-        Total number of crops indexed.
+        Total number of points indexed.
     """
     if local_dir is None:
         local_dir = Path(__file__).resolve().parent.parent.parent / "data" / "input"
@@ -181,7 +209,7 @@ def index_all(
         from rag.storage.s3 import sync_all
         sync_all(local_dir)
 
-    image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
+    image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".heic", ".heif"}
     images = sorted(
         f for f in local_dir.iterdir()
         if f.suffix.lower() in image_extensions
@@ -194,8 +222,8 @@ def index_all(
     logger.info("Indexing {} images from {}...", len(images), local_dir)
     total = 0
     for img_path in images:
-        count = index_image(img_path, num_rows, overlap_px)
+        count = index_image(img_path, num_crops)
         total += count
 
-    logger.info("Done. Indexed {} total crops from {} images.", total, len(images))
+    logger.info("Done. Indexed {} total points from {} images.", total, len(images))
     return total

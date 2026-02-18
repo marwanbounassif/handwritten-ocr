@@ -56,7 +56,10 @@ def search_context(
     dense_vecs = embed_dense([query])
     sparse_vecs = embed_sparse([query])
 
-    query_filter_conditions = []
+    query_filter_conditions = [
+        # Exclude unannotated points (auto-indexed with zero text vectors)
+        FieldCondition(key="confidence_score", range=Range(gt=0.0)),
+    ]
     if chunk_types:
         query_filter_conditions.append(
             FieldCondition(key="chunk_type", match=MatchAny(any=chunk_types))

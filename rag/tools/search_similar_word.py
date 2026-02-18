@@ -10,6 +10,7 @@ from qdrant_client.models import (
     Filter,
     MatchAny,
     Prefetch,
+    Range,
 )
 
 from rag.client import get_client
@@ -56,10 +57,11 @@ def search_similar_word(
 
     word_filter = Filter(
         must=[
+            FieldCondition(key="confidence_score", range=Range(gt=0.0)),
             FieldCondition(
                 key="chunk_type",
                 match=MatchAny(any=["word", "phrase"]),
-            )
+            ),
         ]
     )
 

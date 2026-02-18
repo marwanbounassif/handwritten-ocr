@@ -16,7 +16,7 @@ from loguru import logger
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_LOCAL_DIR = _PROJECT_ROOT / "data" / "input"
 
-_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".heic", ".heif"}
 
 
 def _bucket_name() -> str:
