@@ -24,6 +24,7 @@ def transcribe_single(
     ground_truth_path: Path | None = None,
     max_iterations: int | None = None,
     accept_threshold: int | None = None,
+    scholar_count: int | None = None,
 ) -> Path:
     """Transcribe a single image and save all outputs. Returns the transcription path."""
     import time
@@ -32,6 +33,10 @@ def transcribe_single(
     from ocr_agent.graph import build_ocr_graph
     from ocr_agent.tools import evaluate, parse_ground_truth
     from ocr_agent.trace import Trace
+
+    # Override scholar count if provided
+    if scholar_count is not None:
+        config.SCHOLAR_COUNT = scholar_count
 
     name = image_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +69,8 @@ def transcribe_single(
         },
         "trace_events": [],
         "start_time": time.monotonic(),
+        "council_votes": [],
+        "context_passages": [],
     }
 
     # Run the graph
@@ -153,6 +160,12 @@ def main():
         default=None,
         help="Critic confidence threshold to auto-accept (0-100)",
     )
+    parser.add_argument(
+        "--scholar-count",
+        type=int,
+        default=None,
+        help="Number of scholars in the council (default: 5)",
+    )
 
     args = parser.parse_args()
 
@@ -178,6 +191,7 @@ def main():
             ground_truth_path=args.ground_truth,
             max_iterations=args.max_iterations,
             accept_threshold=args.accept_threshold,
+            scholar_count=args.scholar_count,
         )
         return
 
@@ -207,6 +221,7 @@ def main():
             ground_truth_path=gt_path,
             max_iterations=args.max_iterations,
             accept_threshold=args.accept_threshold,
+            scholar_count=args.scholar_count,
         )
 
     print(f"\nAll done. Results saved to {output_dir}")

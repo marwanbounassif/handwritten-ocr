@@ -34,3 +34,7 @@ PREPROCESSING_STRATEGIES = [
     ["deskew", "remove_lines", "high_contrast"],       # lined notebook paper
     ["deskew", "high_contrast", "binarize"],           # very faint ink
 ]
+
+# ── Scholar Council ──────────────────────────────────────────────
+SCHOLAR_COUNT = 5
+SCHOLAR_TEMPERATURES = [0.1, 0.3, 0.5, 0.3, 0.1]

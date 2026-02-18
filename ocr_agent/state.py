@@ -27,6 +27,8 @@ class OCRState(TypedDict):
     config: dict  # accept_threshold, plateau_patience, strategies, agreement_threshold
     trace_events: list[dict]
     start_time: float
+    council_votes: list[dict]  # Vote tallies from each council round
+    context_passages: list[dict]  # TBD — populated by RAG context retrieval
 
 
 def trace_log(

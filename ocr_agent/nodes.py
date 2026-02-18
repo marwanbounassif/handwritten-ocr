@@ -3,7 +3,14 @@ LangGraph node functions for the agentic OCR pipeline.
 Each node receives OCRState and returns a partial state update dict.
 """
 
-from ocr_agent.agents import CriticResult, run_arbitrator, run_critic, run_editor
+from ocr_agent.agents import (
+    CriticResult,
+    run_arbitrator,
+    run_arbitrator_council,
+    run_council,
+    run_critic,
+    run_editor,
+)
 from ocr_agent.state import OCRState, trace_log
 from ocr_agent.tools import (
     compare_versions,
@@ -134,8 +141,97 @@ def node_initial_ocr(state: OCRState) -> dict:
     }
 
 
+def node_council(state: OCRState) -> dict:
+    """Run the scholar council, update score and plateau tracking."""
+    iteration = state["iteration"] + 1
+    if iteration == 1:
+        print("\n=== PHASE 2: Scholar Council Loop ===")
+    print(f"\n--- Iteration {iteration} ---")
+
+    # Reconstruct previous critique if available
+    prev_critique = None
+    if state["prev_critique"]:
+        try:
+            prev_critique = CriticResult.model_validate(state["prev_critique"])
+        except Exception:
+            pass
+
+    council = run_council(
+        transcription=state["current_best"],
+        context_passages=state.get("context_passages", []),
+        previous_critique=prev_critique,
+    )
+
+    # Apply winning readings to current_best
+    current_best = council.final_text
+
+    # Store the merged critique in the same format as before
+    critiques = list(state["critiques"])
+    critiques.append(council.merged_critique.model_dump())
+
+    confidence = council.consensus_confidence
+    verdict = council.consensus_verdict
+    merged = council.merged_critique
+    n_issues = sum(len(seg.issues) for seg in merged.segments)
+    n_critical = sum(
+        1 for seg in merged.segments for issue in seg.issues if issue.severity == "critical"
+    )
+    n_minor = sum(
+        1 for seg in merged.segments for issue in seg.issues if issue.severity == "minor"
+    )
+    n_ambiguous = sum(
+        1 for seg in merged.segments for issue in seg.issues if issue.severity == "ambiguous"
+    )
+    n_cosmetic = n_issues - n_critical - n_minor - n_ambiguous
+
+    trace_events = [trace_log(
+        state,
+        iteration=iteration,
+        agent="council",
+        action="council_vote",
+        input_summary=f"Transcription ({len(state['current_best'])} chars)",
+        output_summary=(
+            f"Council: confidence {confidence}, verdict={verdict} "
+            f"(tally {council.verdict_tally}, "
+            f"{n_issues} issues: {n_critical} critical, {n_ambiguous} ambiguous, "
+            f"{n_minor} minor, {n_cosmetic} cosmetic)"
+        ),
+        full_input={"transcription": state["current_best"]},
+        full_output=council.model_dump(),
+        metrics={
+            "confidence": confidence,
+            "n_issues": n_issues,
+            "n_critical": n_critical,
+            "n_ambiguous": n_ambiguous,
+            "n_minor": n_minor,
+            "n_cosmetic": n_cosmetic,
+            "verdict_tally": council.verdict_tally,
+            "n_reading_votes": len(council.votes),
+        },
+        decision=verdict,
+    )]
+
+    # Plateau detection
+    plateau_count = state["plateau_count"]
+    if confidence <= state["prev_score"]:
+        plateau_count += 1
+    else:
+        plateau_count = 0
+
+    return {
+        "iteration": iteration,
+        "critiques": critiques,
+        "current_best": current_best,
+        "current_score": confidence,
+        "council_votes": state.get("council_votes", []) + [council.model_dump()],
+        "plateau_count": plateau_count,
+        "prev_score": confidence,
+        "trace_events": state["trace_events"] + trace_events,
+    }
+
+
 def node_critic(state: OCRState) -> dict:
-    """Run critic agent, update score and plateau tracking."""
+    """Run critic agent, update score and plateau tracking. (Legacy — kept for standalone use.)"""
     iteration = state["iteration"] + 1
     if iteration == 1:
         print("\n=== PHASE 2: Critique-Edit Loop ===")
@@ -264,40 +360,45 @@ def node_reocr(state: OCRState) -> dict:
     # Unload OCR model again
     unload_ocr_model()
 
-    # Use arbitrator to merge new candidate with current best
+    # Use arbitrator council to merge new candidate with current best
     new_candidate = candidates[-1]
     versions = [
         {"text": state["current_best"], "source": "current_best", "score": state["current_score"]},
         {"text": new_candidate["text"], "source": new_candidate["source"]},
     ]
 
-    arb_result = run_arbitrator(versions)
+    council = run_arbitrator_council(
+        versions=versions,
+        context_passages=state.get("context_passages", []),
+    )
 
     trace_events.append(trace_log(
         state,
         iteration=state["iteration"],
-        agent="arbitrator",
-        action="arbitrate",
+        agent="arbitrator-council",
+        action="arbitrate_council",
         input_summary=f"Current best vs {new_candidate['source']}",
         output_summary=(
-            f"Arbitrator: merged with confidence {arb_result.confidence}, "
-            f"{len(arb_result.uncertain_segments)} uncertain segments"
+            f"Arbitrator council: merged with confidence {council.consensus_confidence}, "
+            f"tally {council.verdict_tally}, "
+            f"{len(council.votes)} reading votes"
         ),
-        full_output=arb_result.model_dump(),
+        full_output=council.model_dump(),
         metrics={
-            "confidence": arb_result.confidence,
-            "n_decisions": len(arb_result.decisions),
-            "n_uncertain": len(arb_result.uncertain_segments),
+            "confidence": council.consensus_confidence,
+            "verdict_tally": council.verdict_tally,
+            "n_reading_votes": len(council.votes),
         },
     ))
 
     latest_critique_dict = state["critiques"][-1] if state["critiques"] else None
 
     return {
-        "current_best": arb_result.final_text,
+        "current_best": council.final_text,
         "candidates": candidates,
         "strategies_used": strategies_used,
         "prev_critique": latest_critique_dict,
+        "council_votes": state.get("council_votes", []) + [council.model_dump()],
         "trace_events": state["trace_events"] + trace_events,
     }
 

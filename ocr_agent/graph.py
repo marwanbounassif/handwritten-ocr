@@ -6,7 +6,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ocr_agent.nodes import (
     node_accept,
-    node_critic,
+    node_council,
     node_editor,
     node_initial_ocr,
     node_max_iter,
@@ -20,7 +20,7 @@ from ocr_agent.state import OCRState
 
 
 def route_after_critic(state: OCRState) -> str:
-    """Decide next step after critic evaluates the transcription."""
+    """Decide next step after council evaluates the transcription."""
     latest = state["critiques"][-1]
     confidence = latest["overall_confidence"]
     verdict = latest["verdict"]
@@ -40,7 +40,7 @@ def route_after_reocr(state: OCRState) -> str:
     """After re-OCR, check if strategies are exhausted."""
     if state.get("reason") == "exhausted":
         return "max_iterations"
-    return "critic"
+    return "council"
 
 
 # ── Graph builder ────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ def build_ocr_graph():
     builder = StateGraph(OCRState)
 
     builder.add_node("initial_ocr", node_initial_ocr)
-    builder.add_node("critic", node_critic)
+    builder.add_node("council", node_council)
     builder.add_node("editor", node_editor)
     builder.add_node("reocr", node_reocr)
     builder.add_node("accept", node_accept)
@@ -59,17 +59,17 @@ def build_ocr_graph():
     builder.add_node("max_iterations", node_max_iter)
 
     builder.add_edge(START, "initial_ocr")
-    builder.add_edge("initial_ocr", "critic")
-    builder.add_conditional_edges("critic", route_after_critic, {
+    builder.add_edge("initial_ocr", "council")
+    builder.add_conditional_edges("council", route_after_critic, {
         "accept": "accept",
         "plateau": "plateau",
         "max_iterations": "max_iterations",
         "reocr": "reocr",
         "edit": "editor",
     })
-    builder.add_edge("editor", "critic")
+    builder.add_edge("editor", "council")
     builder.add_conditional_edges("reocr", route_after_reocr, {
-        "critic": "critic",
+        "council": "council",
         "max_iterations": "max_iterations",
     })
     builder.add_edge("accept", END)

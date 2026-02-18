@@ -5,10 +5,12 @@ Each agent is an LLM call to Qwen3 via a specific system prompt with structured 
 
 import json
 import re
+from collections import Counter
 from typing import Literal, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ocr_agent import config
 from ocr_agent.tools import call_llm_json
 
 
@@ -18,7 +20,7 @@ from ocr_agent.tools import call_llm_json
 class CriticIssue(BaseModel):
     model_config = ConfigDict(extra="ignore")
     description: str = ""
-    severity: Literal["critical", "minor", "cosmetic"] = "minor"
+    severity: Literal["critical", "minor", "cosmetic", "ambiguous"] = "minor"
     suggestion: str = ""
 
 
@@ -65,6 +67,43 @@ class ArbitratorResult(BaseModel):
     decisions: list[ArbitratorDecision] = []
     confidence: int = Field(default=0, ge=0, le=100)
     uncertain_segments: list[str] = []
+
+
+# ── Scholar Council models ───────────────────────────────────────
+
+
+class ScholarReading(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    segment_text: str = ""
+    proposed_reading: str = ""
+    reasoning: str = ""
+
+
+class ScholarResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    overall_confidence: int = Field(default=0, ge=0, le=100)
+    segments: list[CriticSegment] = []
+    verdict: Literal["accept", "needs_editing", "needs_reocr"] = "needs_editing"
+    reasoning: str = ""
+    readings: list[ScholarReading] = []
+
+
+class ScholarVote(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    segment_text: str = ""
+    winning_reading: str = ""
+    vote_counts: dict[str, int] = {}
+    total_votes: int = 0
+
+
+class CouncilResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    final_text: str
+    consensus_verdict: str = "needs_editing"
+    consensus_confidence: int = Field(default=0, ge=0, le=100)
+    votes: list[ScholarVote] = []
+    verdict_tally: dict[str, int] = {}
+    merged_critique: CriticResult = Field(default_factory=CriticResult)
 
 
 # ── Schema → prompt helper ────────────────────────────────────────
@@ -341,3 +380,326 @@ def run_arbitrator(versions: list[dict]) -> ArbitratorResult:
 
     print(f"  [arbitrator] Merged (confidence {result.confidence})")
     return result
+
+
+# ── Scholar Council ──────────────────────────────────────────────
+
+SCHOLAR_PERSPECTIVES = [
+    {
+        "name": "Grammarian",
+        "focus": (
+            "You are a grammarian. Focus on grammar, syntax, and subject-verb agreement. "
+            "Flag any sentence that doesn't parse correctly. Pay close attention to verb tenses, "
+            "articles, prepositions, and word order that OCR may have garbled."
+        ),
+    },
+    {
+        "name": "Contextual Analyst",
+        "focus": (
+            "You are a contextual analyst. Focus on semantic coherence and thematic flow. "
+            "Does each sentence make sense in the context of the surrounding text? "
+            "Flag segments where the meaning seems implausible or contradicts the document's theme. "
+            "Propose readings that restore semantic plausibility."
+        ),
+    },
+    {
+        "name": "Paleography Expert",
+        "focus": (
+            "You are a paleography expert specializing in handwriting recognition errors. "
+            "Focus on common character confusion patterns: 'rn' ↔ 'm', 'cl' ↔ 'd', 'li' ↔ 'h', "
+            "'vv' ↔ 'w', 'ri' ↔ 'n'. Also look for split words, merged words, and misread "
+            "ascenders/descenders (t/l, p/b, etc.)."
+        ),
+    },
+    {
+        "name": "Frequency Analyst",
+        "focus": (
+            "You are a frequency analyst. Focus on word frequency, common collocations, and "
+            "idiomatic phrases. If a word or phrase is extremely rare but a common alternative "
+            "exists that would fit the context, flag it as ambiguous and propose the more likely "
+            "reading. Consider whether word combinations are natural in English."
+        ),
+    },
+    {
+        "name": "Document Specialist",
+        "focus": (
+            "You are a document specialist. Focus on cross-document consistency, formatting "
+            "patterns, and structural coherence. Check that names, dates, and references are "
+            "internally consistent. Use any provided context passages from other pages to "
+            "disambiguate readings."
+        ),
+    },
+]
+
+SCHOLAR_USER_TEMPLATE = """\
+Analyze the following OCR transcription for errors and quality issues.
+
+## Transcription
+{transcription}
+
+{context_section}
+
+{previous_critique_section}
+
+## Output format
+Respond with ONLY a JSON object matching this schema:
+{schema}
+
+Guidelines for verdict:
+- "accept": text is coherent and readable, no critical issues, confidence > 85
+- "needs_editing": text has identifiable issues that can be fixed from context
+- "needs_reocr": text is so garbled that linguistic correction alone won't recover it
+
+For ambiguous segments (where two valid readings exist), use severity "ambiguous" and provide
+your proposed reading in the readings array."""
+
+ARBITRATOR_COUNCIL_USER_TEMPLATE = """\
+Compare these OCR transcription versions and vote on which reading is best for each segment.
+
+{versions_text}
+
+{context_section}
+
+## Output format
+Respond with ONLY a JSON object matching this schema:
+{schema}
+
+For each segment where the versions disagree, include an entry in readings with your proposed
+reading and reasoning. Your verdict should reflect the overall quality of the best merged result."""
+
+
+def run_scholar(
+    transcription: str,
+    perspective: dict,
+    context_passages: list[dict],
+    temperature: float,
+    previous_critique: CriticResult | None = None,
+) -> ScholarResult:
+    """Run one scholar with its specific system prompt and temperature."""
+    system_prompt = CRITIC_SYSTEM_PROMPT + "\n\n## Your Specialist Lens\n" + perspective["focus"]
+
+    context_section = ""
+    if context_passages:
+        passages_text = "\n".join(
+            f"- [{p.get('source', 'unknown')}]: {p.get('text', '')}"
+            for p in context_passages
+        )
+        context_section = f"## Context Passages (from other pages/documents)\n{passages_text}"
+
+    previous_section = ""
+    if previous_critique:
+        previous_section = (
+            "## Previous Critique (for context — the text was edited since)\n"
+            f"Previous confidence: {previous_critique.overall_confidence}\n"
+            f"Previous verdict: {previous_critique.verdict}\n"
+            f"Previous reasoning: {previous_critique.reasoning}"
+        )
+
+    user_msg = SCHOLAR_USER_TEMPLATE.format(
+        transcription=transcription,
+        context_section=context_section,
+        previous_critique_section=previous_section,
+        schema=schema_example(ScholarResult),
+    )
+
+    name = perspective["name"]
+    print(f"  [scholar:{name}] Analyzing transcription (temp={temperature})...")
+    raw = call_llm_json(
+        system_prompt, user_msg,
+        temperature=temperature,
+        json_schema=ScholarResult.model_json_schema(),
+    )
+
+    try:
+        result = ScholarResult.model_validate(raw)
+    except ValidationError as e:
+        print(f"  [scholar:{name}] WARNING: output validation failed: {e}")
+        result = ScholarResult(
+            overall_confidence=0,
+            verdict="needs_editing",
+            reasoning="LLM output failed schema validation",
+        )
+
+    print(f"  [scholar:{name}] Verdict: {result.verdict} (confidence {result.overall_confidence})")
+    return result
+
+
+def _tally_votes(scholar_results: list[ScholarResult], transcription: str) -> CouncilResult:
+    """Tally votes from all scholars into a CouncilResult."""
+    # Tally verdict votes
+    verdict_counts: Counter[str] = Counter()
+    for r in scholar_results:
+        verdict_counts[r.verdict] += 1
+    consensus_verdict = verdict_counts.most_common(1)[0][0]
+
+    # Average confidence
+    consensus_confidence = round(
+        sum(r.overall_confidence for r in scholar_results) / len(scholar_results)
+    )
+
+    # Tally per-segment readings (only for ambiguous segments with proposed readings)
+    reading_votes: dict[str, Counter[str]] = {}
+    for r in scholar_results:
+        for reading in r.readings:
+            key = reading.segment_text
+            if key not in reading_votes:
+                reading_votes[key] = Counter()
+            reading_votes[key][reading.proposed_reading] += 1
+
+    votes = []
+    final_text = transcription
+    for segment_text, counts in reading_votes.items():
+        winning_reading, winning_count = counts.most_common(1)[0]
+        votes.append(ScholarVote(
+            segment_text=segment_text,
+            winning_reading=winning_reading,
+            vote_counts=dict(counts),
+            total_votes=sum(counts.values()),
+        ))
+        # Apply winning reading to the transcription
+        if segment_text in final_text:
+            final_text = final_text.replace(segment_text, winning_reading, 1)
+
+    # Merge all scholars' segments into a single critique (union, highest severity wins)
+    seen_segments: dict[str, CriticSegment] = {}
+    severity_rank = {"critical": 3, "ambiguous": 2, "minor": 1, "cosmetic": 0}
+    for r in scholar_results:
+        for seg in r.segments:
+            key = seg.text
+            if key not in seen_segments:
+                seen_segments[key] = seg
+            else:
+                existing = seen_segments[key]
+                # Keep the one with highest severity issues
+                existing_max = max(
+                    (severity_rank.get(i.severity, 0) for i in existing.issues), default=0
+                )
+                new_max = max(
+                    (severity_rank.get(i.severity, 0) for i in seg.issues), default=0
+                )
+                if new_max > existing_max:
+                    seen_segments[key] = seg
+
+    merged_critique = CriticResult(
+        overall_confidence=consensus_confidence,
+        segments=list(seen_segments.values()),
+        verdict=consensus_verdict,
+        reasoning=f"Council consensus ({dict(verdict_counts)})",
+    )
+
+    return CouncilResult(
+        final_text=final_text,
+        consensus_verdict=consensus_verdict,
+        consensus_confidence=consensus_confidence,
+        votes=votes,
+        verdict_tally=dict(verdict_counts),
+        merged_critique=merged_critique,
+    )
+
+
+def run_council(
+    transcription: str,
+    context_passages: list[dict],
+    previous_critique: CriticResult | None = None,
+) -> CouncilResult:
+    """
+    Run all scholars sequentially, tally votes, and return a CouncilResult.
+    """
+    temperatures = config.SCHOLAR_TEMPERATURES
+    scholar_count = config.SCHOLAR_COUNT
+    perspectives = SCHOLAR_PERSPECTIVES[:scholar_count]
+
+    print(f"\n  [council] Running {len(perspectives)} scholars...")
+    results = []
+    for i, perspective in enumerate(perspectives):
+        temp = temperatures[i] if i < len(temperatures) else 0.3
+        result = run_scholar(
+            transcription=transcription,
+            perspective=perspective,
+            context_passages=context_passages,
+            temperature=temp,
+            previous_critique=previous_critique,
+        )
+        results.append(result)
+
+    council = _tally_votes(results, transcription)
+    print(
+        f"  [council] Consensus: {council.consensus_verdict} "
+        f"(confidence {council.consensus_confidence}, "
+        f"tally {council.verdict_tally})"
+    )
+    return council
+
+
+def run_arbitrator_council(
+    versions: list[dict],
+    context_passages: list[dict],
+) -> CouncilResult:
+    """
+    Variant of run_council for the reocr path.
+    Each scholar compares two transcription versions and votes on the best segments.
+    """
+    versions_text_parts = []
+    for i, v in enumerate(versions, 1):
+        score_info = f" (critic score: {v.get('score', 'N/A')})" if "score" in v else ""
+        versions_text_parts.append(
+            f"## Version {i} — {v.get('source', 'unknown')}{score_info}\n{v['text']}"
+        )
+    versions_text = "\n\n".join(versions_text_parts)
+
+    context_section = ""
+    if context_passages:
+        passages_text = "\n".join(
+            f"- [{p.get('source', 'unknown')}]: {p.get('text', '')}"
+            for p in context_passages
+        )
+        context_section = f"## Context Passages (from other pages/documents)\n{passages_text}"
+
+    temperatures = config.SCHOLAR_TEMPERATURES
+    scholar_count = config.SCHOLAR_COUNT
+    perspectives = SCHOLAR_PERSPECTIVES[:scholar_count]
+
+    print(f"\n  [arbitrator-council] Running {len(perspectives)} scholars on {len(versions)} versions...")
+    results = []
+    for i, perspective in enumerate(perspectives):
+        temp = temperatures[i] if i < len(temperatures) else 0.3
+        system_prompt = (
+            ARBITRATOR_SYSTEM_PROMPT + "\n\n## Your Specialist Lens\n" + perspective["focus"]
+        )
+
+        user_msg = ARBITRATOR_COUNCIL_USER_TEMPLATE.format(
+            versions_text=versions_text,
+            context_section=context_section,
+            schema=schema_example(ScholarResult),
+        )
+
+        name = perspective["name"]
+        print(f"  [scholar:{name}] Comparing versions (temp={temp})...")
+        raw = call_llm_json(
+            system_prompt, user_msg,
+            temperature=temp,
+            json_schema=ScholarResult.model_json_schema(),
+        )
+
+        try:
+            result = ScholarResult.model_validate(raw)
+        except ValidationError as e:
+            print(f"  [scholar:{name}] WARNING: output validation failed: {e}")
+            result = ScholarResult(
+                overall_confidence=0,
+                verdict="needs_editing",
+                reasoning="LLM output failed schema validation",
+            )
+
+        print(f"  [scholar:{name}] Verdict: {result.verdict} (confidence {result.overall_confidence})")
+        results.append(result)
+
+    # Use the first version's text as the base for applying reading votes
+    base_text = versions[0]["text"] if versions else ""
+    council = _tally_votes(results, base_text)
+    print(
+        f"  [arbitrator-council] Consensus: {council.consensus_verdict} "
+        f"(confidence {council.consensus_confidence}, "
+        f"tally {council.verdict_tally})"
+    )
+    return council
