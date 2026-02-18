@@ -23,6 +23,12 @@ dependencies = [
     "verovio",
     "compressed-tensors",
     "python-dotenv",
+    # --- rag tooling layer ---
+    "qdrant-client>=1.9",
+    "fastembed>=0.3",
+    "onnxruntime>=1.17,<1.24",
+    "open-clip-torch>=2.24",
+    "loguru>=0.7",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +38,7 @@ notebooks = ["jupyter", "ipykernel", "matplotlib"]
 ocr = "ocr_agent.transcribe:main"
 
 [tool.poetry]
-packages = [{ include = "ocr_agent" }]
+packages = [{ include = "ocr_agent" }, { include = "rag" }]
 
 [build-system]
 requires = ["poetry-core"]
