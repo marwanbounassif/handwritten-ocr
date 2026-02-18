@@ -52,6 +52,7 @@ huggingface/
 data/input/*.jpg
 data/input/*.jpeg
 data/input/*.png
+data/input/*.HEIC
 data/input/*.bmp
 data/input/*.tiff
 data/output/*.txt
